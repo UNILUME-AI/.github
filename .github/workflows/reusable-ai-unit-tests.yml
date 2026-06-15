@@ -1,0 +1,161 @@
+# Reusable: AI unit-test generation + gate (EPIC-0002 F1), shared via workflow_call.
+# Productionizes the unilume-lab spike. Generates Vitest tests FROM acceptance criteria (AC) +
+# an interface signature (never the implementation), verifies fail-first (red against a throwing
+# stub), runs them against the real impl, commits the test back, and gates per the Feature's
+# `verification` declaration. Gen script + central config live once in `harness` (checked out here).
+#
+# Caller (business repo) example:
+#   jobs:
+#     ai-tests:
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-ai-unit-tests.yml@main
+#       with:
+#         work_dir: prototypes/ai-tests-kimi
+#         ac_file: docs/requirements/discount.md
+#         iface_file: src/discount.iface.ts
+#         out_file: src/discount.test.ts
+#         module_path: src/discount.ts
+#         module_import: ./discount
+#         verification: advisory          # required | advisory | skip
+#       secrets:
+#         MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+#         HARNESS_TOKEN: ${{ secrets.SCRUM_TOKEN }}   # PAT with harness Contents:read
+name: reusable-ai-unit-tests
+
+on:
+  workflow_call:
+    inputs:
+      work_dir:      { type: string, required: true }
+      ac_file:       { type: string, required: true }
+      iface_file:    { type: string, required: true }
+      out_file:      { type: string, required: true }
+      module_path:   { type: string, required: true }
+      module_import: { type: string, required: true }
+      verification:  { type: string, default: "advisory" }
+      test_cmd:      { type: string, default: "npx vitest run" }
+    secrets:
+      MOONSHOT_API_KEY: { required: true }
+      HARNESS_TOKEN:    { required: true }
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ai-unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ai-unit-tests:
+    if: ${{ inputs.verification != 'skip' && (github.event_name != 'pull_request' || github.event.pull_request.merged != true) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller (Feature code + AC)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Checkout harness (config + gen script — single source)
+        uses: actions/checkout@v4
+        with:
+          repository: UNILUME-AI/harness
+          path: _harness
+          token: ${{ secrets.HARNESS_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Load central config → env
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import yaml
+          g = yaml.safe_load(open("_harness/config/ai-tests.yml"))["generation"]
+          print(f"MOONSHOT_BASE_URL={g['base_url']}")
+          print(f"MOONSHOT_MODEL={g['model']['default']}")
+          print(f"GEN_MAX_TOKENS={g.get('max_tokens', 32768)}")
+          print(f"GEN_TIMEOUT_SECONDS={g.get('timeout_seconds', 300)}")
+          PY
+
+      - name: Generate tests from AC (provider-agnostic)
+        working-directory: ${{ inputs.work_dir }}
+        env:
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          AC_FILE: ${{ inputs.ac_file }}
+          IFACE_FILE: ${{ inputs.iface_file }}
+          OUT_FILE: ${{ inputs.out_file }}
+          MODULE_IMPORT: ${{ inputs.module_import }}
+        run: node "$GITHUB_WORKSPACE/_harness/scripts/gen-tests.mjs"
+
+      - name: Install deps
+        working-directory: ${{ inputs.work_dir }}
+        run: npm ci || npm install --no-audit --no-fund
+
+      - name: fail-first (tests must be red against a throwing stub)
+        working-directory: ${{ inputs.work_dir }}
+        env:
+          IFACE: ${{ inputs.iface_file }}
+          MODULE: ${{ inputs.module_path }}
+          TEST_CMD: ${{ inputs.test_cmd }}
+        run: |
+          set -u
+          cp "$MODULE" /tmp/impl.head
+          # derive a throwing stub from the (flat) interface declarations
+          node -e '
+            const fs = require("fs");
+            const src = fs.readFileSync(process.env.IFACE, "utf8");
+            const stub = src.replace(/export\s+function\s+(\w+)\s*\([^;]*?;/g,
+              (_m, n) => `export function ${n}(...args){throw new Error("fail-first stub");}`);
+            fs.writeFileSync(process.env.MODULE, stub);
+          '
+          if bash -c "$TEST_CMD" >/tmp/ff.log 2>&1; then
+            echo "::error::fail-first violated — generated tests PASS against a throwing stub (not constraining behavior)"
+            cp /tmp/impl.head "$MODULE"
+            exit 1
+          fi
+          echo "fail-first OK — tests are red against the stub"
+          cp /tmp/impl.head "$MODULE"
+
+      - name: Commit generated tests back to the PR
+        if: ${{ github.event_name == 'pull_request' }}
+        working-directory: ${{ inputs.work_dir }}
+        env:
+          GH_TOKEN_PUSH: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          OUT_FILE: ${{ inputs.out_file }}
+        run: |
+          git add "$OUT_FILE"
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git config user.name "ai-tests[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "test(ai-gen): 依 AC 生成单测 [ai-gen]"
+          git push "https://x-access-token:${GH_TOKEN_PUSH}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${HEAD_REF}"
+
+      - name: Run tests against the real implementation + gate
+        working-directory: ${{ inputs.work_dir }}
+        env:
+          VERIFICATION: ${{ inputs.verification }}
+          TEST_CMD: ${{ inputs.test_cmd }}
+        run: |
+          set -u
+          if bash -c "$TEST_CMD"; then
+            echo "tests green against the real implementation"
+          else
+            if [ "$VERIFICATION" = "required" ]; then
+              echo "::error::required gate — tests fail against the implementation"
+              exit 1
+            fi
+            echo "::warning::tests fail but verification=$VERIFICATION (advisory) — not blocking"
+          fi
+
+      - name: Report to PR
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          VERIFICATION: ${{ inputs.verification }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+            --body "AI 单测(verification=$VERIFICATION):已依 AC 生成、fail-first 校验、对实现执行。详见 job 日志。"
