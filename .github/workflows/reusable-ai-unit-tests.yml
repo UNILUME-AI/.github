@@ -19,6 +19,12 @@
 #       secrets:
 #         MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
 #         HARNESS_TOKEN: ${{ secrets.SCRUM_TOKEN }}   # PAT with harness Contents:read
+#
+# Constraints (keep callers honest):
+#   - iface_file must declare FLAT function signatures: `export [declare] function NAME(...): T;`
+#     (one terminating `;` per signature). Arrow/const exports (`export const f = (...) => …`) are
+#     not stubbed — fail-first then errors loudly (nothing to stub) instead of degrading silently.
+#   - test_cmd is run as argv (whitespace-split), not via a shell: no pipes / && / redirection.
 name: reusable-ai-unit-tests
 
 on:
@@ -41,7 +47,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: ai-unit-tests-${{ github.ref }}
+  group: ai-unit-tests-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,11 +55,20 @@ jobs:
     if: ${{ inputs.verification != 'skip' && (github.event_name != 'pull_request' || github.event.pull_request.merged != true) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Validate inputs
+        env:
+          VERIFICATION: ${{ inputs.verification }}
+        run: |
+          case "$VERIFICATION" in
+            required|advisory|skip) ;;
+            *) echo "::error::invalid verification: '$VERIFICATION' (expected required|advisory|skip)"; exit 1 ;;
+          esac
+
       - name: Checkout caller (Feature code + AC)
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.ref || github.ref }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Checkout harness (config + gen script — single source)
         uses: actions/checkout@v4
@@ -69,7 +84,8 @@ jobs:
 
       - name: Load central config → env
         run: |
-          python3 -m pip install --quiet pyyaml
+          # PyYAML ships on ubuntu-latest; only install if absent (saves ~15s most runs).
+          python3 -c "import yaml" 2>/dev/null || python3 -m pip install --quiet pyyaml
           python3 - <<'PY' >> "$GITHUB_ENV"
           import yaml
           g = yaml.safe_load(open("_harness/config/ai-tests.yml"))["generation"]
@@ -80,7 +96,11 @@ jobs:
           PY
 
       - name: Generate tests from AC (provider-agnostic)
+        id: gen
         working-directory: ${{ inputs.work_dir }}
+        # gen-tests.mjs uses only Node built-ins (node:fs + global fetch/AbortController), so it
+        # needs no node_modules — running before `npm ci` is intentional: fail fast on a gen/API
+        # error before paying the install cost.
         env:
           MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
           AC_FILE: ${{ inputs.ac_file }}
@@ -94,6 +114,7 @@ jobs:
         run: npm ci || npm install --no-audit --no-fund
 
       - name: fail-first (tests must be red against a throwing stub)
+        id: failfirst
         working-directory: ${{ inputs.work_dir }}
         env:
           IFACE: ${{ inputs.iface_file }}
@@ -101,22 +122,30 @@ jobs:
           TEST_CMD: ${{ inputs.test_cmd }}
         run: |
           set -u
-          cp "$MODULE" /tmp/impl.head
-          # derive a throwing stub from the (flat) interface declarations
+          cp "$MODULE" "$RUNNER_TEMP/impl.head"
+          # derive a throwing stub from the flat interface declarations; fail loudly if none match
           node -e '
             const fs = require("fs");
             const src = fs.readFileSync(process.env.IFACE, "utf8");
-            const stub = src.replace(/export\s+function\s+(\w+)\s*\([^;]*?;/g,
-              (_m, n) => `export function ${n}(...args){throw new Error("fail-first stub");}`);
+            let n = 0;
+            const stub = src.replace(/export\s+(?:declare\s+)?function\s+(\w+)\s*\([^;]*?;/g,
+              (_m, name) => { n++; return `export function ${name}(...args){throw new Error("fail-first stub");}`; });
+            if (n === 0) {
+              console.error("fail-first: no `export [declare] function NAME(...);` signature found in " +
+                process.env.IFACE + " — nothing to stub (arrow/const exports unsupported).");
+              process.exit(1);
+            }
             fs.writeFileSync(process.env.MODULE, stub);
+            console.error("fail-first: stubbed " + n + " function(s)");
           '
-          if bash -c "$TEST_CMD" >/tmp/ff.log 2>&1; then
+          read -ra CMD <<< "$TEST_CMD"
+          if "${CMD[@]}" >"$RUNNER_TEMP/ff.log" 2>&1; then
             echo "::error::fail-first violated — generated tests PASS against a throwing stub (not constraining behavior)"
-            cp /tmp/impl.head "$MODULE"
+            cp "$RUNNER_TEMP/impl.head" "$MODULE"
             exit 1
           fi
           echo "fail-first OK — tests are red against the stub"
-          cp /tmp/impl.head "$MODULE"
+          cp "$RUNNER_TEMP/impl.head" "$MODULE"
 
       - name: Commit generated tests back to the PR
         if: ${{ github.event_name == 'pull_request' }}
@@ -134,15 +163,19 @@ jobs:
           git push "https://x-access-token:${GH_TOKEN_PUSH}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${HEAD_REF}"
 
       - name: Run tests against the real implementation + gate
+        id: gate
         working-directory: ${{ inputs.work_dir }}
         env:
           VERIFICATION: ${{ inputs.verification }}
           TEST_CMD: ${{ inputs.test_cmd }}
         run: |
           set -u
-          if bash -c "$TEST_CMD"; then
+          read -ra CMD <<< "$TEST_CMD"
+          if "${CMD[@]}"; then
             echo "tests green against the real implementation"
+            echo "TEST_OUTCOME=pass" >> "$GITHUB_ENV"
           else
+            echo "TEST_OUTCOME=fail" >> "$GITHUB_ENV"
             if [ "$VERIFICATION" = "required" ]; then
               echo "::error::required gate — tests fail against the implementation"
               exit 1
@@ -156,6 +189,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
           VERIFICATION: ${{ inputs.verification }}
+          GEN_OUTCOME: ${{ steps.gen.outcome }}
+          FF_OUTCOME: ${{ steps.failfirst.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
         run: |
+          set -u
+          # TEST_OUTCOME (pass|fail) is exported by the gate step via GITHUB_ENV; earlier-stage
+          # failures (gen/fail-first) are read from step outcomes so the comment never lies.
+          if [ "$GEN_OUTCOME" != "success" ]; then
+            status="测试生成失败"
+          elif [ "$FF_OUTCOME" != "success" ]; then
+            status="fail-first 未通过(测试对 throwing stub 未变红,或接口无可 stub 的签名)"
+          elif [ "${TEST_OUTCOME:-}" = "pass" ]; then
+            status="对实现执行通过"
+          elif [ "${TEST_OUTCOME:-}" = "fail" ]; then
+            status="对实现执行未通过(verification=$VERIFICATION)"
+          else
+            status="未执行到门禁(详见 job 日志)"
+          fi
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
-            --body "AI 单测(verification=$VERIFICATION):已依 AC 生成、fail-first 校验、对实现执行。详见 job 日志。"
+            --body "AI 单测(verification=$VERIFICATION):依 AC 生成 + fail-first 校验 + 对实现执行 → ${status}。详见 job 日志。"
