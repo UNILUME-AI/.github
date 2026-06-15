@@ -1,7 +1,9 @@
 name: Claude Code
 
-# 仅在评论 / Issue 中 @claude 时触发(不自动跑每个 PR,避免烧订阅额度)。
-# 配方沿用 UNILUME-AI/unilume-lab 已端到端验证的 claude.yml。
+# 仅在评论 / Issue 中 @claude 时触发(不自动跑每个 PR,省额度)。
+# 逻辑(@claude 过滤 + claude-code-action)已抽到 reusable-claude.yml;本文件只留触发器 +
+# 权限 + 委派。触发器与 id-token 权限必须留在各仓本地(GitHub 只跑仓库内的事件 workflow,
+# org .github 不下发 workflow;reusable 不能提权超过 caller 上限)。
 # 注意:issue_comment 类触发要求本 workflow 先在默认分支才生效。
 on:
   issue_comment:
@@ -13,32 +15,13 @@ on:
   issues:
     types: [opened, assigned]
 
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
 jobs:
   claude:
-    # 过滤:评论 / Issue 正文里 @claude 才触发。
-    # 触发者授权由 claude-code-action 内置校验把关——仅有仓库写权限者能真正跑起来;
-    # 不要加 author_association 闸:private org 成员在 webhook 载荷里会被显示成 NONE 而被误挡。
-    if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      id-token: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Run Claude Code
-        uses: anthropics/claude-code-action@v1
-        with:
-          # 订阅授权(Pro/Max),org secret(all 仓可见)。
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # 默认 Sonnet。要用 Opus 取消下一行注释:
-          # claude_args: "--model claude-opus-4-8 --max-turns 15"
+    uses: UNILUME-AI/.github/.github/workflows/reusable-claude.yml@main
+    secrets: inherit
