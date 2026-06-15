@@ -1,0 +1,60 @@
+name: reusable-ts-machine-gate
+
+# 机器门 (machine gate) for TypeScript repos, shared via workflow_call. A business repo
+# wires it as a REQUIRED check:
+#
+#   # .github/workflows/ci.yml
+#   jobs:
+#     gate:
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-ts-machine-gate.yml@main
+#       with:
+#         node-version: '22'
+#
+# Lint/format/typecheck/test come from @unilume/conventions (anti-corrosion: one source).
+# Inputs are passed via env, never interpolated into run: scripts.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+      working-directory:
+        type: string
+        default: '.'
+      run-tests:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  machine-gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Format check
+        run: npx prettier --check .
+
+      - name: Lint
+        run: npx eslint .
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        if: ${{ inputs.run-tests }}
+        run: npm test --if-present
