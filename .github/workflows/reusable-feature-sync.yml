@@ -1,0 +1,68 @@
+# Reusable: Feature → Epic/board sync, shared via workflow_call (anti-corrosion: one source).
+# A business repo calls this on Feature spec merge; the reconcile scripts live ONCE in `scrum`
+# (checked out here), so business repos vendor nothing — only a ~8-line caller. Usage:
+#
+#   jobs:
+#     link:
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-feature-sync.yml@main
+#       secrets: inherit
+#
+# Caller triggers: pull_request {types:[closed], paths:['specs/**/spec.md']} + workflow_dispatch.
+# Needs secret SCRUM_TOKEN (fine-grained PAT: org Projects R/W + Issues R/W on the caller repo
+# AND scrum + Contents R/W on scrum).
+name: reusable-feature-sync
+
+on:
+  workflow_call:
+    secrets:
+      SCRUM_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  link:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SCRUM_TOKEN }}
+    steps:
+      - name: Checkout caller repo (Feature specs live here)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout scrum (reconcile scripts — single source)
+        uses: actions/checkout@v4
+        with:
+          repository: UNILUME-AI/scrum
+          path: _scrum
+          token: ${{ secrets.SCRUM_TOKEN }}
+          fetch-depth: 1
+
+      - name: Collect changed spec files
+        id: changed
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'specs/**/spec.md')
+          { echo 'files<<__EOF__'; echo "$files"; echo '__EOF__'; } >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile Feature → Epic links
+        env:
+          FILES: ${{ steps.changed.outputs.files }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          SCRIPT=_scrum/extensions/unilume/scripts/bash/reconcile-feature.sh
+          [ -f "$SCRIPT" ] || { echo "::error::$SCRIPT not found in scrum checkout"; exit 1; }
+          files="$FILES"
+          # a manual run has no PR diff to scope to → reconcile every Feature spec
+          if [ -z "${files//[[:space:]]/}" ] && [ "$EVENT" = "workflow_dispatch" ]; then
+            files="$(git ls-files 'specs/**/spec.md')"
+          fi
+          if [ -z "${files//[[:space:]]/}" ]; then echo "no spec files"; exit 0; fi
+          mapfile -t arr <<< "$files"
+          bash "$SCRIPT" "${arr[@]}"
