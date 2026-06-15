@@ -1,0 +1,55 @@
+# Org-default approval policy for Palantir policy-bot — the 人评门 (human gate) of 双门禁.
+#
+# policy-bot (https://github.com/palantir/policy-bot) is a GitHub App. Point its
+# `options.policy.remote` / org fallback at this file: a repo with no own `.policy.yml`
+# inherits this default. Make the policy-bot status check REQUIRED in branch protection
+# so the human gate actually blocks merge (constitution §VII: git/CI = 强制力).
+#
+# Until policy-bot is deployed, the interim human gate is branch protection
+# "require N approvals" + per-repo CODEOWNERS (see README).
+
+policy:
+  approval:
+    - or:
+        - changes to governance or cross-repo contracts
+        - default — one non-author review
+
+disapproval:
+  requires:
+    organizations:
+      - "UNILUME-AI"
+
+approval_rules:
+  # Default machine-tier gate: any one approval from an org member who is not the author.
+  - name: default — one non-author review
+    requires:
+      count: 1
+      organizations:
+        - "UNILUME-AI"
+    options:
+      allow_author: false
+      allow_contributor: true
+      invalidate_on_push: true
+      ignore_update_merges: true
+      methods:
+        github_review: true
+
+  # Stricter tier: edits to constitution / contracts / shared conventions need CODEOWNERS,
+  # mirroring the tiered-SDD "懂/不懂" reviewer-familiarity knob (R-tiers in scrum).
+  - name: changes to governance or cross-repo contracts
+    if:
+      changed_files:
+        paths:
+          - "^\\.specify/memory/constitution\\.md$"
+          - "^governance/"
+          - "^docs/contracts/"
+          - "^.*\\.policy\\.yml$"
+    requires:
+      count: 1
+      teams:
+        - "UNILUME-AI/maintainers"
+    options:
+      allow_author: false
+      invalidate_on_push: true
+      methods:
+        github_review: true

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Theme / Epic (coordination)
+    url: https://github.com/UNILUME-AI/scrum
+    about: Cross-repo or strategic work is planned as a Theme/Epic in scrum, not as a repo issue.
