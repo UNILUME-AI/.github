@@ -16,6 +16,7 @@
 #         module_path: src/discount.ts
 #         module_import: ./discount
 #         verification: advisory          # required | advisory | skip
+#         model_tier: default             # (可选) default 低成本 | fast 提速;模型名在 harness 中央配置
 #       secrets:
 #         MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
 #         HARNESS_TOKEN: ${{ secrets.SCRUM_TOKEN }}   # PAT with harness Contents:read
@@ -38,6 +39,7 @@ on:
       module_import: { type: string, required: true }
       verification:  { type: string, default: "advisory" }
       test_cmd:      { type: string, default: "npx vitest run" }
+      model_tier:    { type: string, default: "default" }   # 选 config/ai-tests.yml generation.model.<tier>:default(低成本)| fast(提速);未知键回退 default
     secrets:
       MOONSHOT_API_KEY: { required: true }
       HARNESS_TOKEN:    { required: true }
@@ -83,14 +85,22 @@ jobs:
           node-version: '20'
 
       - name: Load central config → env
+        env:
+          MODEL_TIER: ${{ inputs.model_tier }}   # 经 env 传入,不插值进脚本(防注入)
         run: |
           # PyYAML ships on ubuntu-latest; only install if absent (saves ~15s most runs).
           python3 -c "import yaml" 2>/dev/null || python3 -m pip install --quiet pyyaml
           python3 - <<'PY' >> "$GITHUB_ENV"
-          import yaml
+          import os, sys, yaml
           g = yaml.safe_load(open("_harness/config/ai-tests.yml"))["generation"]
+          models = g["model"]
+          tier = os.environ.get("MODEL_TIER") or "default"
+          model = models.get(tier)
+          if not model:
+              print(f"::warning::unknown model_tier '{tier}', falling back to default", file=sys.stderr)
+              model = models["default"]
           print(f"MOONSHOT_BASE_URL={g['base_url']}")
-          print(f"MOONSHOT_MODEL={g['model']['default']}")
+          print(f"MOONSHOT_MODEL={model}")
           print(f"GEN_MAX_TOKENS={g.get('max_tokens', 32768)}")
           print(f"GEN_TIMEOUT_SECONDS={g.get('timeout_seconds', 300)}")
           PY
