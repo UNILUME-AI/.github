@@ -9,6 +9,7 @@
 #     issues: { types: [opened, assigned] }
 #   permissions:
 #     contents: write
+#     actions: read
 #     pull-requests: write
 #     issues: write
 #     id-token: write
@@ -23,6 +24,8 @@
 #     issue_comment / PR-review triggers locally.
 #   - id-token: write must be granted at the CALLER level: a reusable workflow's permissions are
 #     capped by the caller's ceiling and cannot be elevated beyond it.
+#   - actions: read enables the github_ci MCP server (CI status / job logs). Same capping rule:
+#     declare it here AND grant it in the caller, else it falls back to none.
 # Needs secret CLAUDE_CODE_OAUTH_TOKEN (org secret, all-repos visible); callers pass it via
 # `secrets: inherit`.
 name: reusable-claude
@@ -53,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read # enables github_ci MCP (CI status / job logs); caller must grant it too
       pull-requests: write
       issues: write
       id-token: write
