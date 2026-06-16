@@ -10,6 +10,7 @@
 #   permissions:
 #     contents: write
 #     actions: read
+#     checks: read
 #     pull-requests: write
 #     issues: write
 #     id-token: write
@@ -26,6 +27,8 @@
 #     capped by the caller's ceiling and cannot be elevated beyond it.
 #   - actions: read enables the github_ci MCP server (CI status / job logs). Same capping rule:
 #     declare it here AND grant it in the caller, else it falls back to none.
+#   - checks: read lets @claude read Check annotations (e.g. SonarCloud findings) via gh api.
+#     Same capping rule: declare here AND in the caller.
 # Needs secret CLAUDE_CODE_OAUTH_TOKEN (org secret, all-repos visible); callers pass it via
 # `secrets: inherit`.
 name: reusable-claude
@@ -57,6 +60,7 @@ jobs:
     permissions:
       contents: write
       actions: read # enables github_ci MCP (CI status / job logs); caller must grant it too
+      checks: read # lets @claude read Check annotations (e.g. SonarCloud findings); caller must grant it too
       pull-requests: write
       issues: write
       id-token: write
