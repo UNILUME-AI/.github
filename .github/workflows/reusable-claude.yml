@@ -77,3 +77,13 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # 默认 Sonnet;caller 传 claude_args 可切 Opus 等。
           claude_args: ${{ inputs.claude_args }}
+          # 现签的 Claude-App 安装令牌默认只带 contents/pull_requests/issues
+          # (claude-code-action token.ts 的 DEFAULT_PERMISSIONS)。job 级 permissions
+          # 只管默认 GITHUB_TOKEN,agent 的 gh 用的是这枚 app token,故须在此把
+          # actions/checks 追加进 app token,否则:
+          #   - mcp__github_ci(查 CI 状态/日志)缺 actions scope 而降级;
+          #   - gh api check-runs/{id}/annotations 读 SonarCloud 注解 → 403。
+          # 追加权限受 caller 的 job permissions 上限约束(已声明 actions/checks: read)。
+          additional_permissions: |
+            actions: read
+            checks: read
