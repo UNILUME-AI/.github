@@ -16,8 +16,14 @@
 #     id-token: write
 #   jobs:
 #     claude:
-#       uses: UNILUME-AI/.github/.github/workflows/reusable-claude.yml@main
-#       secrets: inherit
+#       # Pin to a commit SHA (Sonar supply-chain rule: mutable @main refs fail the gate).
+#       # Get the SHA to pin (rerun when upgrading the reusable):
+#       #   gh api repos/UNILUME-AI/.github/commits/main --jq .sha
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-claude.yml@<commit-sha> # main YYYY-MM-DD
+#       secrets:
+#         # Pass explicitly, not `secrets: inherit` — this is the only secret declared below;
+#         # least privilege, and Sonar flags blanket inherit.
+#         CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 #
 # Why the caller still needs triggers + permissions (cannot be fully hidden here):
 #   - Triggers live in the CALLER: GitHub only runs a repo's own event workflows; the org `.github`
@@ -29,8 +35,8 @@
 #     declare it here AND grant it in the caller, else it falls back to none.
 #   - checks: read lets @claude read Check annotations (e.g. SonarCloud findings) via gh api.
 #     Same capping rule: declare here AND in the caller.
-# Needs secret CLAUDE_CODE_OAUTH_TOKEN (org secret, all-repos visible); callers pass it via
-# `secrets: inherit`.
+# Needs secret CLAUDE_CODE_OAUTH_TOKEN (org secret, all-repos visible); callers pass it
+# explicitly (see Usage above), not via `secrets: inherit`.
 name: reusable-claude
 
 on:
