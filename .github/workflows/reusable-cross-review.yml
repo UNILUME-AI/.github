@@ -1,0 +1,281 @@
+# Reusable: Claude↔Codex 交叉评审, shared via workflow_call (anti-corrosion: one source for the logic).
+# 各仓用一个薄壳 caller 挂 pull_request 触发器 + 权限 + concurrency,评审逻辑只此一份。用法:
+#
+#   on:
+#     pull_request:
+#       types: [opened, reopened, ready_for_review, labeled, unlabeled]
+#       paths-ignore: ['**.md']
+#   concurrency:
+#     group: cross-review-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
+#   permissions:            # 必须 >= reusable 各 job 所需并集(reusable 权限受 caller 上限约束)
+#     contents: read
+#     actions: read
+#     pull-requests: write
+#     id-token: write
+#   jobs:
+#     cross-review:
+#       # 钉 commit SHA(Sonar 供应链规则:@main 可变引用过不了门)。取 SHA:
+#       #   gh api repos/UNILUME-AI/.github/commits/main --jq .sha
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-cross-review.yml@<commit-sha> # main YYYY-MM-DD
+#       secrets:
+#         # 显式传,不用 secrets: inherit(最小权限;Sonar 也拦 blanket inherit)。
+#         CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+#         CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+#
+# 路由:Claude 写→Codex 审;Codex 写→Claude 审;混合看「最后一次提交」;human/无签名→默认 Claude。
+# 控制标签:no-ai-review 豁免;author:claude|codex 强制指定。跳草稿。
+# 触发器/权限/concurrency/paths-ignore 必须在 CALLER:GitHub 只跑仓库内事件 workflow,org .github 不下发;
+# 且 reusable 权限不能超 caller 上限、id-token 须 caller 授予。
+#
+# 认证(两家都走订阅,org secret,all 仓可见,caller 显式传):
+#   Claude → CLAUDE_CODE_OAUTH_TOKEN;Codex → CODEX_AUTH_JSON(ChatGPT 订阅 auth.json 全文)。
+#   ⚠️ Codex auth.json 含刷新令牌,失效时须在可信机器 `codex login` 后重生成 secret。
+# 安全:Codex 侧把不可信 diff 喂给能读文件的 agent,故 codex exec 用 read-only(无网络)+
+#   贴评论前对 auth.json 的令牌串做输出脱敏,双保险防注入外泄凭据。
+name: reusable-cross-review
+
+on:
+  workflow_call:
+    secrets:
+      CODEX_AUTH_JSON:
+        required: true
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  # ── 1) 判定作者 → 选出「另一家」评审方 ─────────────────────────────
+  detect:
+    # 非 label 事件照常;label 事件只在控制标签变动时才跑,避免加无关标签也触发评审。
+    if: >
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      contains(fromJSON('["no-ai-review","author:claude","author:codex"]'), github.event.label.name)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      reviewer: ${{ steps.d.outputs.reviewer }} # codex | claude | none
+      author: ${{ steps.d.outputs.author }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Fetch base ref
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: git fetch --no-tags origin "$BASE_REF" || true
+      - name: Detect author → pick cross reviewer
+        id: d
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+
+          # (0) 草稿 PR 不自动评(需要就 @claude / @codex 手动触发)
+          if [ "${IS_DRAFT}" = "true" ]; then
+            echo "author=draft"  >> "$GITHUB_OUTPUT"
+            echo "reviewer=none"  >> "$GITHUB_OUTPUT"
+            echo "::notice::草稿 PR → 跳过自动评审"; exit 0
+          fi
+
+          # (1) 豁免标签(最高优先级)
+          case ",$LABELS," in
+            *",no-ai-review,"*)
+              echo "author=exempt" >> "$GITHUB_OUTPUT"
+              echo "reviewer=none" >> "$GITHUB_OUTPUT"
+              echo "::notice::no-ai-review → 跳过所有 AI 评审"; exit 0 ;;
+          esac
+
+          # (2) 强制指定作者
+          author=""
+          case ",$LABELS," in
+            *",author:claude,"*) author="claude" ;;
+            *",author:codex,"*)  author="codex"  ;;
+          esac
+
+          # (3) 扫签名判定作者;混合(两家都有)时按「最后一次提交」定向
+          if [ -z "$author" ]; then
+            CLAUDE_PAT='Co-Authored-By: *Claude|noreply@anthropic\.com|Generated with .*Claude Code|claude\[bot\]'
+            CODEX_PAT='Co-authored-by: *Codex|noreply@openai\.com|chatgpt-codex-connector'
+
+            all="$(git log --format='%an%x09%ae%x09%cn%x09%ce%x09%B' "${BASE_SHA}..${HEAD_SHA}" || true)"
+            all="${all}
+          PR_AUTHOR:${PR_AUTHOR}"
+            claude=0; codex=0
+            printf '%s\n' "$all" | grep -qiE "$CLAUDE_PAT" && claude=1 || true
+            printf '%s\n' "$all" | grep -qiE "$CODEX_PAT"  && codex=1  || true
+
+            if   [ "$claude" = 1 ] && [ "$codex" = 0 ]; then author="claude"
+            elif [ "$codex"  = 1 ] && [ "$claude" = 0 ]; then author="codex"
+            elif [ "$claude" = 1 ] && [ "$codex"  = 1 ]; then
+              # 混合:只看最后一次提交(HEAD),谁写的就让另一家审
+              last="$(git log -1 --format='%an%x09%ae%x09%cn%x09%ce%x09%B' "${HEAD_SHA}" || true)"
+              lc=0; lx=0
+              printf '%s\n' "$last" | grep -qiE "$CLAUDE_PAT" && lc=1 || true
+              printf '%s\n' "$last" | grep -qiE "$CODEX_PAT"  && lx=1 || true
+              if   [ "$lc" = 1 ] && [ "$lx" = 0 ]; then author="claude"  # 最后一次 Claude → Codex 审
+              elif [ "$lx" = 1 ] && [ "$lc" = 0 ]; then author="codex"   # 最后一次 Codex  → Claude 审
+              else author="mixed"   # 最后一次也分不清(human/双签)→ 落默认 Claude
+              fi
+            else author="unknown"   # 无签名:human 或 签名被关
+            fi
+          fi
+
+          # (4) 反向映射:Claude 写 → Codex 审;其余一切 → 默认 Claude
+          case "$author" in
+            claude) reviewer="codex"  ;;
+            codex)  reviewer="claude" ;;
+            *)      reviewer="claude" ;;
+          esac
+          echo "author=$author"     >> "$GITHUB_OUTPUT"
+          echo "reviewer=$reviewer" >> "$GITHUB_OUTPUT"
+          echo "::notice::author=$author → reviewer=$reviewer"
+
+  # ── 2) Codex 审(仅当代码是 Claude 写的)── 官方 cookbook prompt + 订阅 auth.json ──
+  codex-review:
+    needs: detect
+    if: needs.detect.outputs.reviewer == 'codex'
+    name: Codex reviews Claude's code
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      # #2:checkout HEAD_SHA(不用 refs/pull/N/merge)——冲突 PR 的 merge ref 可能不存在,照样能审。
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fetch base ref
+        run: |
+          set -euxo pipefail
+          git fetch --no-tags origin "$BASE_REF"
+
+      - name: Restore Codex auth (ChatGPT 订阅 auth.json)
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CODEX_HOME: ${{ runner.temp }}/codex_home # runner 上下文只能在 step 级用,不能在 job env
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEX_AUTH_JSON:-}" ]; then
+            echo "::error::缺少 CODEX_AUTH_JSON secret(Codex 订阅 auth.json)"; exit 1
+          fi
+          mkdir -p "$CODEX_HOME" && chmod 700 "$CODEX_HOME"
+          printf '%s' "$CODEX_AUTH_JSON" > "$CODEX_HOME/auth.json"
+          chmod 600 "$CODEX_HOME/auth.json"
+          # 强制用文件存储的凭据(auth.json),别去找钥匙串/密钥库
+          printf 'cli_auth_credentials_store = "file"\n' > "$CODEX_HOME/config.toml"
+
+      - name: Build Codex review prompt (官方 cookbook prompt + 本 PR diff)
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' "You are acting as a reviewer for a proposed code change made by another engineer."
+            printf '%s\n' "Focus on issues that impact correctness, performance, security, maintainability, or developer experience."
+            printf '%s\n' "Flag only actionable issues introduced by the pull request."
+            printf '%s\n' "When you flag an issue, provide a short, direct explanation and cite the affected file and line range."
+            printf '%s\n' "Prioritize severe issues and avoid nit-level comments unless they block understanding of the diff."
+            printf '%s\n' "After listing findings, produce an overall correctness verdict (\"patch is correct\" or \"patch is incorrect\") with a concise justification and a confidence score between 0 and 1."
+            printf '%s\n' "Output your review as GitHub-flavored Markdown."
+            echo ""
+            echo "Repository: ${REPOSITORY}"
+            echo "Pull Request #: ${PR_NUMBER}"
+            echo "Base SHA: ${BASE_SHA}"
+            echo "Head SHA: ${HEAD_SHA}"
+            echo ""
+            echo "Changed files:"
+            git --no-pager diff --name-status "${BASE_SHA}...${HEAD_SHA}"
+            echo ""
+            echo "Unified diff (context=5):"
+            git --no-pager diff --unified=5 "${BASE_SHA}...${HEAD_SHA}"
+          } > codex-prompt.md
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      # 直接跑 codex exec(订阅 auth.json)。codex-action 绑死需 api-key 的 Responses proxy、
+      # 不支持纯订阅认证,故弃用;codex exec 才是官方 CI 订阅认证的用法。read-only = 无网络自泄。
+      - name: Run Codex review
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex_home
+        run: |
+          set -uo pipefail
+          codex exec --sandbox read-only --skip-git-repo-check \
+            --output-last-message codex-review-body.md \
+            < codex-prompt.md
+
+      # 有输出→脱敏后贴评审;无输出→兜底提示,绝不静默。
+      - name: Post Codex result
+        if: ${{ always() }}
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CODEX_HOME: ${{ runner.temp }}/codex_home
+        run: |
+          set -euo pipefail
+          if [ -s codex-review-body.md ]; then
+            # #1′ 输出脱敏:把 auth.json 里 >=16 字符的令牌串从评审正文字面抹掉,
+            # 防被注入诱导 codex 读出凭据再公开。longest-first,over-redaction 无害。
+            if [ -f "$CODEX_HOME/auth.json" ]; then
+              jq -r '[.. | strings] | map(select(length >= 16)) | .[]' "$CODEX_HOME/auth.json" > redact-toks.txt 2>/dev/null || true
+              if [ -s redact-toks.txt ]; then
+                python3 -c 'import sys,functools; t=sorted({l.strip() for l in open(sys.argv[1]) if l.strip()},key=len,reverse=True); b=open(sys.argv[2],encoding="utf-8").read(); b=functools.reduce(lambda s,x: s.replace(x,"***REDACTED***"),t,b); open(sys.argv[2],"w",encoding="utf-8").write(b)' redact-toks.txt codex-review-body.md
+              fi
+            fi
+            { echo "## 🤖 Codex review(Claude 提交的代码)"; echo ""; cat codex-review-body.md; } > codex-comment.md
+          else
+            {
+              echo "## ⚠️ Codex review 未产出结果"
+              echo ""
+              echo "codex exec 没有输出(订阅 auth.json 令牌失效、超时或执行错误)。"
+              echo "请查看[运行日志](${RUN_URL})排查;必要时在可信机器上重新 \`codex login\` 并更新 CODEX_AUTH_JSON secret。"
+            } > codex-comment.md
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPOSITORY" --body-file codex-comment.md
+
+  # ── 3) Claude 审(Codex/human/混合/无签名)── 沿用原有评审配置 ──────────
+  claude-review:
+    needs: detect
+    if: needs.detect.outputs.reviewer == 'claude'
+    name: Claude reviews non-Claude code
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # claude-code-action 装 github_ci MCP(查 CI / 读 job 日志)
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需完整历史以 diff PR
+
+      - name: Run Claude review
+        # gh api repos/anthropics/claude-code-action/commits/v1 --jq .sha
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # --allowedTools 放行发评论的工具;prompt 模式不自动贴评论,必须显式授权 + 指示发布。
+          claude_args: '--model claude-opus-4-8 --max-turns 100 --allowedTools "mcp__github_inline_comment__create_inline_comment,mcp__github_ci__*,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            审查本 PR 的代码变更,聚焦正确性 bug、边界情况、安全与可维护性。
+            按严重度 🔴 必修 / 🟡 建议 / 🟢 可选 给出结论,指出文件与行号并说明理由;
+            非阻断的建议性评审,无明显问题则简要说明通过,不必强凑。
+            PR 分支已检出在当前工作目录。
+            用 `gh pr comment` 发顶层评审结论;用 mcp__github_inline_comment__create_inline_comment(confirmed: true)对具体代码行留行内评论。
+            只发 GitHub 评论,不要把评审正文当消息返回。
