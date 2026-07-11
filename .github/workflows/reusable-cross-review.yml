@@ -23,6 +23,7 @@
 #         CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
 #         CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 #
+# 结构:2 个 job = 2 行 check —— detect(路由)+ review(内部按 detect 结果选 Codex 或 Claude)。
 # 路由:Claude 写→Codex 审;Codex 写→Claude 审;混合看「最后一次提交」;human/无签名→默认 Claude。
 # 控制标签:no-ai-review 豁免;author:claude|codex 强制指定。跳草稿。
 # 触发器/权限/concurrency/paths-ignore 必须在 CALLER:GitHub 只跑仓库内事件 workflow,org .github 不下发;
@@ -136,17 +137,18 @@ jobs:
           echo "reviewer=$reviewer" >> "$GITHUB_OUTPUT"
           echo "::notice::author=$author → reviewer=$reviewer"
 
-  # ── 2) Codex 审(仅当代码是 Claude 写的)── 官方 cookbook prompt + 订阅 auth.json ──
-  codex-review:
+  # ── 2) 评审:一个 job 内按 detect 结果选 Codex 或 Claude(合成 = 一行 check)──
+  review:
     needs: detect
-    if: needs.detect.outputs.reviewer == 'codex'
-    name: Codex reviews Claude's code
+    if: needs.detect.outputs.reviewer == 'codex' || needs.detect.outputs.reviewer == 'claude'
+    name: cross review
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read # claude 路径的 claude-code-action 装 github_ci MCP
       pull-requests: write
+      id-token: write
     env:
-      GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -160,12 +162,15 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
+      # ═══════════ Codex 路径(仅当代码是 Claude 写的)═══════════
       - name: Fetch base ref
+        if: needs.detect.outputs.reviewer == 'codex'
         run: |
           set -euxo pipefail
           git fetch --no-tags origin "$BASE_REF"
 
       - name: Restore Codex auth (ChatGPT 订阅 auth.json)
+        if: needs.detect.outputs.reviewer == 'codex'
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CODEX_HOME: ${{ runner.temp }}/codex_home # runner 上下文只能在 step 级用,不能在 job env
@@ -181,6 +186,7 @@ jobs:
           printf 'cli_auth_credentials_store = "file"\n' > "$CODEX_HOME/config.toml"
 
       - name: Build Codex review prompt (官方 cookbook prompt + 本 PR diff)
+        if: needs.detect.outputs.reviewer == 'codex'
         run: |
           set -euo pipefail
           {
@@ -205,11 +211,12 @@ jobs:
           } > codex-prompt.md
 
       - name: Install Codex CLI
+        if: needs.detect.outputs.reviewer == 'codex'
         run: npm install -g @openai/codex
 
-      # 直接跑 codex exec(订阅 auth.json)。codex-action 绑死需 api-key 的 Responses proxy、
-      # 不支持纯订阅认证,故弃用;codex exec 才是官方 CI 订阅认证的用法。read-only = 无网络自泄。
+      # codex exec 直跑(订阅 auth.json);read-only = 无网络自泄。
       - name: Run Codex review
+        if: needs.detect.outputs.reviewer == 'codex'
         env:
           CODEX_HOME: ${{ runner.temp }}/codex_home
         run: |
@@ -218,10 +225,11 @@ jobs:
             --output-last-message codex-review-body.md \
             < codex-prompt.md
 
-      # 有输出→脱敏后贴评审;无输出→兜底提示,绝不静默。
+      # 有输出→脱敏后贴评审;无输出→兜底提示,绝不静默。GH_TOKEN 只挂这步,避免干扰 claude-code-action 的令牌。
       - name: Post Codex result
-        if: ${{ always() }}
+        if: ${{ always() && needs.detect.outputs.reviewer == 'codex' }}
         env:
+          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CODEX_HOME: ${{ runner.temp }}/codex_home
         run: |
@@ -246,24 +254,9 @@ jobs:
           fi
           gh pr comment "$PR_NUMBER" --repo "$REPOSITORY" --body-file codex-comment.md
 
-  # ── 3) Claude 审(Codex/human/混合/无签名)── 沿用原有评审配置 ──────────
-  claude-review:
-    needs: detect
-    if: needs.detect.outputs.reviewer == 'claude'
-    name: Claude reviews non-Claude code
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read # claude-code-action 装 github_ci MCP(查 CI / 读 job 日志)
-      pull-requests: write
-      id-token: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 需完整历史以 diff PR
-
+      # ═══════════ Claude 路径(Codex/human/混合/无签名)═══════════
       - name: Run Claude review
+        if: needs.detect.outputs.reviewer == 'claude'
         # gh api repos/anthropics/claude-code-action/commits/v1 --jq .sha
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:
