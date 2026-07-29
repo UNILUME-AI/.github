@@ -60,13 +60,18 @@ jobs:
         run: |
           set -euo pipefail
           total=$(( ADDITIONS + DELETIONS ))
-          echo "变更 ${total} 行（+${ADDITIONS} / -${DELETIONS}），涉及 ${FILES} 个文件；阈值 ${THRESHOLD}。"
+          # inputs 声明的 type: number 允许小数，而 [ -le ] 只吃整数：threshold=1000.5 会让
+          # 测试报 "integer expression expected" 并返回非零，在 if 里就等同于「超标」——
+          # 一个 1000 行的 PR 会被静默地误打上标签，而报错只进 stderr 没人看。截断成整数，
+          # 让实际行为与声明的入参类型对齐。
+          threshold=${THRESHOLD%%.*}
+          echo "变更 ${total} 行（+${ADDITIONS} / -${DELETIONS}），涉及 ${FILES} 个文件；阈值 ${threshold}。"
           {
             echo "### PR 体量"
             echo ""
             echo "| 变更行数 | 新增 | 删除 | 文件数 | 阈值 |"
             echo "|---:|---:|---:|---:|---:|"
-            echo "| ${total} | ${ADDITIONS} | ${DELETIONS} | ${FILES} | ${THRESHOLD} |"
+            echo "| ${total} | ${ADDITIONS} | ${DELETIONS} | ${FILES} | ${threshold} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # 本 job 在每次 synchronize 上重跑，所以两个分支都必须把标签调成与当前体量一致——
@@ -76,7 +81,7 @@ jobs:
             gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qxF "$LABEL"
           }
 
-          if [ "$total" -le "$THRESHOLD" ]; then
+          if [ "$total" -le "$threshold" ]; then
             echo "✅ 在阈值内。" >> "$GITHUB_STEP_SUMMARY"
             if labelled; then
               gh pr edit "$PR" --repo "$REPO" --remove-label "$LABEL"
@@ -92,5 +97,5 @@ jobs:
 
           # --force 使命令幂等：标签已存在时不报错。
           gh label create "$LABEL" --repo "$REPO" --color D93F0B \
-            --description "变更超过 ${THRESHOLD} 行" --force
+            --description "变更超过 ${threshold} 行" --force
           gh pr edit "$PR" --repo "$REPO" --add-label "$LABEL"
