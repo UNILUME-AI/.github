@@ -14,6 +14,7 @@
 #       uses: UNILUME-AI/.github/.github/workflows/reusable-pr-size.yml@<commit-sha> # main YYYY-MM-DD
 #       permissions:
 #         pull-requests: write
+#         issues: write
 
 on:
   workflow_call:
@@ -33,7 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      pull-requests: write # 打标签
+      pull-requests: write # gh pr edit --add-label
+      issues: write # gh label create——GitHub 的 label 端点归 Issues 权限，缺了会被拒且 set -e 直接终止本 step
     steps:
       - name: Flag oversized pull request
         env:
