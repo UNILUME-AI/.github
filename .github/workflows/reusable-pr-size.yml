@@ -77,16 +77,25 @@ jobs:
           # 本 job 在每次 synchronize 上重跑，所以两个分支都必须把标签调成与当前体量一致——
           # 只加不删会让缩回阈值内的 PR 一直挂着 size/XL，标签比 job summary 更显眼，
           # 过期的标签比没有标签更误导人。
-          labelled() {
-            gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qxF "$LABEL"
-          }
-
           if [ "$total" -le "$threshold" ]; then
             echo "✅ 在阈值内。" >> "$GITHUB_STEP_SUMMARY"
-            if labelled; then
-              gh pr edit "$PR" --repo "$REPO" --remove-label "$LABEL"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "（PR 已缩回阈值内，先前的 \`${LABEL}\` 标签已移除。）" >> "$GITHUB_STEP_SUMMARY"
+            # 查询结果必须单独捕获：若把 `gh pr view | grep` 整个塞进 if 条件，
+            # 「查询失败」与「标签不存在」返回同样的非零码，一次瞬时 API 或鉴权故障
+            # 就会被当成「本来就没标签」而跳过移除，留下陈旧标签且检查仍报绿。
+            if labels=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name'); then
+              if grep -qxF "$LABEL" <<<"$labels"; then
+                gh pr edit "$PR" --repo "$REPO" --remove-label "$LABEL"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "（PR 已缩回阈值内，先前的 \`${LABEL}\` 标签已移除。）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              # 不升级为 job 失败——本 job 定位是非阻断提醒，不该因一次读取失败变成
+              # 失败源；但必须留下可见痕迹，否则「标签没同步」会无声无息。
+              echo "::warning::读取 PR 标签失败，本次跳过标签同步；若 ${LABEL} 已存在则可能残留。"
+              {
+                echo ""
+                echo "⚠️ 读取标签失败，未能确认 \`${LABEL}\` 是否需要移除——请以本表的行数为准。"
+              } >> "$GITHUB_STEP_SUMMARY"
             fi
             exit 0
           fi
