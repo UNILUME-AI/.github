@@ -1,0 +1,101 @@
+# PR 体量提醒（非阻断）。
+#
+# 为什么需要：本组织人类评审覆盖率约 1.4%，多数 PR 由 AI 生成并零评审合并。
+# LinearB 2026 基于 810 万 PR 的结论是「PR 体量是速度最显著的驱动因素」，
+# 而体量是当前唯一还能被机器观测到的「人是否看得过来」的代理指标。
+#
+# 为什么不设为必需检查：阈值来自经验法则而非一手研究（「200–400 行发现 70–90% 缺陷」
+# 这一说法查不到原始出处），把无法自动判定的东西做成硬门只会制造绕过。本 workflow
+# 恒定 exit 0，只打标签 + 写 job summary。
+#
+# 调用方式（放在各仓 .github/workflows/pr-size.yml）：
+#   jobs:
+#     size:
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-pr-size.yml@<commit-sha> # main YYYY-MM-DD
+#       permissions:
+#         pull-requests: write
+#         issues: write
+
+on:
+  workflow_call:
+    inputs:
+      threshold:
+        description: '触发提醒的变更行数阈值（additions + deletions）'
+        type: number
+        required: false
+        # 1000 行。按 2026-05~07 的 441 个已合并 PR 回测，约 8% 会触发（P90 为 899 行）。
+        # 定位是「异常大」的告警而非「偏大」的提醒——阈值定低了会天天响，响多了就没人看。
+        default: 1000
+
+permissions: {}
+
+jobs:
+  pr-size:
+    # 标签是本 job 唯一的外部可见状态，而它读的是 event payload 里的体量快照。
+    # 连续推送时若两次运行重叠，旧的「超标」运行可能在新的「未超标」运行清掉标签之后
+    # 才执行 add，把 size/XL 留在一个小 PR 上。取消在跑的旧运行让最新状态永远胜出。
+    # 放 job 级而非 workflow 级：本文件是 reusable，workflow 级并发不受调用方约束，
+    # 而 job 级在每个调用方仓库内各自成组。
+    concurrency:
+      group: pr-size-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write # gh pr edit --add-label
+      issues: write # gh label create——GitHub 的 label 端点归 Issues 权限，缺了会被拒且 set -e 直接终止本 step
+    steps:
+      - name: Flag oversized pull request
+        env:
+          # 全部经 env 传入：不把 ${{ }} 直接插进 shell（防脚本注入）。
+          # 这几个值本身是数字/仓库名，但保持统一写法。
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+          FILES: ${{ github.event.pull_request.changed_files }}
+          THRESHOLD: ${{ inputs.threshold }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LABEL: size/XL
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          total=$(( ADDITIONS + DELETIONS ))
+          # inputs 声明的 type: number 允许小数，而 [ -le ] 只吃整数：threshold=1000.5 会让
+          # 测试报 "integer expression expected" 并返回非零，在 if 里就等同于「超标」——
+          # 一个 1000 行的 PR 会被静默地误打上标签，而报错只进 stderr 没人看。截断成整数，
+          # 让实际行为与声明的入参类型对齐。
+          threshold=${THRESHOLD%%.*}
+          echo "变更 ${total} 行（+${ADDITIONS} / -${DELETIONS}），涉及 ${FILES} 个文件；阈值 ${threshold}。"
+          {
+            echo "### PR 体量"
+            echo ""
+            echo "| 变更行数 | 新增 | 删除 | 文件数 | 阈值 |"
+            echo "|---:|---:|---:|---:|---:|"
+            echo "| ${total} | ${ADDITIONS} | ${DELETIONS} | ${FILES} | ${threshold} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 本 job 在每次 synchronize 上重跑，所以两个分支都必须把标签调成与当前体量一致——
+          # 只加不删会让缩回阈值内的 PR 一直挂着 size/XL，标签比 job summary 更显眼，
+          # 过期的标签比没有标签更误导人。
+          labelled() {
+            gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qxF "$LABEL"
+          }
+
+          if [ "$total" -le "$threshold" ]; then
+            echo "✅ 在阈值内。" >> "$GITHUB_STEP_SUMMARY"
+            if labelled; then
+              gh pr edit "$PR" --repo "$REPO" --remove-label "$LABEL"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "（PR 已缩回阈值内，先前的 \`${LABEL}\` 标签已移除。）" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "⚠️ **超过阈值。** 大 PR 在零人评审下直通主干是当前最大的质量敞口——" \
+               "合并前请确认 codex 的评审已覆盖，或考虑拆分。" >> "$GITHUB_STEP_SUMMARY"
+
+          # --force 使命令幂等：标签已存在时不报错。
+          gh label create "$LABEL" --repo "$REPO" --color D93F0B \
+            --description "变更超过 ${threshold} 行" --force
+          gh pr edit "$PR" --repo "$REPO" --add-label "$LABEL"
