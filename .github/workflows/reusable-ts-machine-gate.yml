@@ -47,6 +47,11 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
+          # 必须显式给出：上面的 defaults.run.working-directory 只作用于 run: 步骤，
+          # 对 uses: 步骤无效。省略时 setup-node 去仓根找 lockfile——调用方把
+          # working-directory 指向嵌套包时，仓根没有 lockfile 会直接失败，仓根有
+          # 另一个 lockfile 则拿到错误的缓存键（更糟：不报错，装出来的依赖对不上）。
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
       - name: Install
         run: npm ci
