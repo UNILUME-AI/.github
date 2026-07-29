@@ -31,6 +31,14 @@ permissions: {}
 
 jobs:
   pr-size:
+    # 标签是本 job 唯一的外部可见状态，而它读的是 event payload 里的体量快照。
+    # 连续推送时若两次运行重叠，旧的「超标」运行可能在新的「未超标」运行清掉标签之后
+    # 才执行 add，把 size/XL 留在一个小 PR 上。取消在跑的旧运行让最新状态永远胜出。
+    # 放 job 级而非 workflow 级：本文件是 reusable，workflow 级并发不受调用方约束，
+    # 而 job 级在每个调用方仓库内各自成组。
+    concurrency:
+      group: pr-size-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
