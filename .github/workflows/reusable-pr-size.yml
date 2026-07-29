@@ -1,0 +1,73 @@
+# PR 体量提醒（非阻断）。
+#
+# 为什么需要：本组织人类评审覆盖率约 1.4%，多数 PR 由 AI 生成并零评审合并。
+# LinearB 2026 基于 810 万 PR 的结论是「PR 体量是速度最显著的驱动因素」，
+# 而体量是当前唯一还能被机器观测到的「人是否看得过来」的代理指标。
+#
+# 为什么不设为必需检查：阈值来自经验法则而非一手研究（「200–400 行发现 70–90% 缺陷」
+# 这一说法查不到原始出处），把无法自动判定的东西做成硬门只会制造绕过。本 workflow
+# 恒定 exit 0，只打标签 + 写 job summary。
+#
+# 调用方式（放在各仓 .github/workflows/pr-size.yml）：
+#   jobs:
+#     size:
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-pr-size.yml@<commit-sha> # main YYYY-MM-DD
+#       permissions:
+#         pull-requests: write
+
+on:
+  workflow_call:
+    inputs:
+      threshold:
+        description: '触发提醒的变更行数阈值（additions + deletions）'
+        type: number
+        required: false
+        # 1000 行。按 2026-05~07 的 441 个已合并 PR 回测，约 8% 会触发（P90 为 899 行）。
+        # 定位是「异常大」的告警而非「偏大」的提醒——阈值定低了会天天响，响多了就没人看。
+        default: 1000
+
+permissions: {}
+
+jobs:
+  pr-size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write # 打标签
+    steps:
+      - name: Flag oversized pull request
+        env:
+          # 全部经 env 传入：不把 ${{ }} 直接插进 shell（防脚本注入）。
+          # 这几个值本身是数字/仓库名，但保持统一写法。
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+          FILES: ${{ github.event.pull_request.changed_files }}
+          THRESHOLD: ${{ inputs.threshold }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          total=$(( ADDITIONS + DELETIONS ))
+          echo "变更 ${total} 行（+${ADDITIONS} / -${DELETIONS}），涉及 ${FILES} 个文件；阈值 ${THRESHOLD}。"
+          {
+            echo "### PR 体量"
+            echo ""
+            echo "| 变更行数 | 新增 | 删除 | 文件数 | 阈值 |"
+            echo "|---:|---:|---:|---:|---:|"
+            echo "| ${total} | ${ADDITIONS} | ${DELETIONS} | ${FILES} | ${THRESHOLD} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$total" -le "$THRESHOLD" ]; then
+            echo "✅ 在阈值内。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "⚠️ **超过阈值。** 大 PR 在零人评审下直通主干是当前最大的质量敞口——" \
+               "合并前请确认 codex 的评审已覆盖，或考虑拆分。" >> "$GITHUB_STEP_SUMMARY"
+
+          # --force 使命令幂等：标签已存在时不报错。
+          gh label create size/XL --repo "$REPO" --color D93F0B \
+            --description "变更超过 ${THRESHOLD} 行" --force
+          gh pr edit "$PR" --repo "$REPO" --add-label size/XL

@@ -1,0 +1,14 @@
+# 只开 github-actions 生态：本文件的目的是防 tj-actions/changed-files 那类供应链攻击
+# (CVE-2025-30066，攻击者把已有版本标签重新指向恶意提交)。第三方 action 一律固定到 40 位
+# commit SHA，Dependabot 会连同其后的 `# vX.Y.Z` 注释一起更新，使固定不会随时间腐化。
+# 不开 npm/pip 生态：那会淹没 PR 列表，且业务依赖升级另有节奏。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
