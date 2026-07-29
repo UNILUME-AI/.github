@@ -23,5 +23,13 @@ permissions:
 
 jobs:
   claude:
-    uses: UNILUME-AI/.github/.github/workflows/reusable-claude.yml@main
-    secrets: inherit
+    # 钉死 commit SHA，与其余 14 个消费仓一致。本仓自引用同样不能用 @main：可变引用正是
+    # CVE-2025-30066（tj-actions/changed-files）的利用面——攻击者把已有引用重新指向恶意提交，
+    # 所有浮动引用下一次 CI 就拉到后门。本仓公开后这一点更实在。升级 reusable 时改此 SHA：
+    # gh api repos/UNILUME-AI/.github/commits/main --jq .sha
+    uses: UNILUME-AI/.github/.github/workflows/reusable-claude.yml@6505d84a3a61b370673f3b9f248b0c8759427921 # main 2026-07-29
+    secrets:
+      # 显式传递而非 inherit：reusable 只声明了这一个 secret，最小权限。
+      # reusable-claude.yml 的文件头本就写明「callers pass it explicitly, not via secrets: inherit」，
+      # 本仓此前是唯一没照做的调用方。
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

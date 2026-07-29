@@ -72,7 +72,11 @@ jobs:
       issues: write
       id-token: write
     steps:
-      - name: Checkout repository
+      # 这里**故意**保留凭证持久化。claude-code-action 放行 `Bash(git:*)`，@claude 修完代码要
+      # 提交并推回分支；关掉持久化会让它推不动。与 reusable-ai-unit-tests 里那两处同类改动的
+      # 区别在可验证性：那边的 push 用显式 token 拼完整 URL，静态就能断定不受影响；这里要真的
+      # @claude 跑一次才知道，本 PR 验证不了——不能验证的改动不塞进来。
+      - name: Checkout repository # zizmor: ignore[artipacked]
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
