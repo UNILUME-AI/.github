@@ -27,7 +27,11 @@ jobs:
     # CVE-2025-30066（tj-actions/changed-files）的利用面——攻击者把已有引用重新指向恶意提交，
     # 所有浮动引用下一次 CI 就拉到后门。本仓公开后这一点更实在。升级 reusable 时改此 SHA：
     # gh api repos/UNILUME-AI/.github/commits/main --jq .sha
-    uses: UNILUME-AI/.github/.github/workflows/reusable-claude.yml@6505d84a3a61b370673f3b9f248b0c8759427921 # main 2026-07-29
+    # 同仓引用走本地路径，不写 owner/repo@sha。GitHub 对 `./` 形式从**调用方所在的
+    # 那次提交**解析被调 workflow：既在单次运行内不可变，又不会指回更早的提交。
+    # 这里写 @sha 反而是错的——钉的必然是父提交，于是同一个 PR 里对 reusable 的改动
+    # 对本仓自己不生效，要等下一次改 pin 才生效。业务仓侧仍钉 SHA：那是跨仓引用。
+    uses: ./.github/workflows/reusable-claude.yml
     secrets:
       # 显式传递而非 inherit：reusable 只声明了这一个 secret，最小权限。
       # reusable-claude.yml 的文件头本就写明「callers pass it explicitly, not via secrets: inherit」，

@@ -36,12 +36,22 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      # 钉 SHA(供应链规则:可变引用不过门)。本文件此前在仓根 workflows/,不在任何
+      # 扫描范围内,也不在 dependabot 覆盖内,因此一直停在 tag 引用。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本 job 只读代码跑检查,不推任何东西。
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
+          # 必须显式给出：上面的 defaults.run.working-directory 只作用于 run: 步骤，
+          # 对 uses: 步骤无效。省略时 setup-node 去仓根找 lockfile——调用方把
+          # working-directory 指向嵌套包时，仓根没有 lockfile 会直接失败，仓根有
+          # 另一个 lockfile 则拿到错误的缓存键（更糟：不报错，装出来的依赖对不上）。
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
       - name: Install
         run: npm ci
