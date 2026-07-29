@@ -77,6 +77,26 @@ jobs:
         with:
           fetch-depth: 1
 
+      # 跨仓共享的 agent 资产,业务仓不存副本(见 UNILUME-AI/agent-kit 的 README)。
+      # 内容必须钉死在一个 commit 上,理由同「action 一律钉 SHA」:本 job 有 contents
+      # 与 pull-requests 写权限、且放行 git/gh,而 skill 是能左右 agent 行为的文本——
+      # 引用可变分支时,agent-kit 的任何改动都会未经本仓评审直接进入这个特权 job。
+      # 升级 skill = 改下面的 SHA(走本仓评审),各仓再 bump 本 workflow 的 SHA:
+      #   gh api repos/UNILUME-AI/agent-kit/commits/main --jq .sha
+      #
+      # 取到 RUNNER_TEMP 而非工作区:放工作区会成为一个嵌套 git 仓,@claude 的
+      # git add 可能把它作为 gitlink 提交进业务仓。
+      # 用 git init + fetch <sha> 而非 actions/checkout:后者的 path 必须位于工作区内。
+      - name: Fetch shared agent skills (pinned)
+        env:
+          AGENT_KIT_SHA: e91224b253a20e3d5dbe41ef69036a8dc754639e # main 2026-07-29
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/agent-kit"
+          git -C "$RUNNER_TEMP/agent-kit" remote add origin https://github.com/UNILUME-AI/agent-kit.git
+          git -C "$RUNNER_TEMP/agent-kit" fetch -q --depth 1 origin "$AGENT_KIT_SHA"
+          git -C "$RUNNER_TEMP/agent-kit" checkout -q FETCH_HEAD
+
       - name: Run Claude Code
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         with:
@@ -84,12 +104,11 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # 默认 Sonnet;caller 传 claude_args 可切 Opus 等。
           claude_args: ${{ inputs.claude_args }}
-          # 跨仓共享的 agent 资产,业务仓不存副本(见 UNILUME-AI/agent-kit 的 README)。
-          # 该仓必须公开:action 的 install-plugins.ts 只 spawn `claude plugin marketplace
-          # add <url>`,不注入任何凭证,且 URL 须匹配 ^https://.+\.git$——SSH 与 owner/repo
-          # 简写都会被校验拒绝。私有仓只能先 checkout 再传本地路径,那需要一枚能读它的
-          # 额外令牌。改 agent-kit 的内容不需要动本文件,也不需要各仓 bump 本 workflow 的 SHA。
-          plugin_marketplaces: https://github.com/UNILUME-AI/agent-kit.git
+          # 传本地路径而非 git URL:action 的 install-plugins.ts 只 spawn
+          # `claude plugin marketplace add <输入>`,对 URL 形式不接受任何 ref/tag
+          # (校验正则要求以 .git 结尾),因此 URL 形式无法钉版本;本地路径形式则由
+          # 上一步按 SHA 取好,是不可变的。
+          plugin_marketplaces: ${{ runner.temp }}/agent-kit
           plugins: unilume-workflow@agent-kit
           # 现签的 Claude-App 安装令牌默认只带 contents/pull_requests/issues
           # (claude-code-action token.ts 的 DEFAULT_PERMISSIONS)。job 级 permissions
