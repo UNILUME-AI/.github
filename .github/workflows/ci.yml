@@ -52,8 +52,9 @@ jobs:
           # 界面上无法区分。本组织确曾因此让版本注释腐化一路绿灯合入；判断依据就是那个
           # suppressed 计数，它不为 0 就说明有审计根本没跑。
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # 只传 .github/：zizmor 按 `.github/workflows/` 这个结构收集输入，仓根的
-        # workflows/ 目录传进去会报 "no inputs collected" 直接失败。那个目录里的
-        # reusable-ts-machine-gate.yml 因此既扫不到、也不会被 GitHub 当 workflow 运行
-        # （reusable 必须放在 .github/workflows/ 才能被 uses: 引用）——已另行记录。
+        # 只传 .github/：zizmor 按 `.github/workflows/` 这个结构收集输入，别的目录传
+        # 进去会报 "no inputs collected"。本仓已不再有 .github/workflows 之外的 workflow
+        # 文件——原先在仓根 workflows/ 的 reusable-ts-machine-gate.yml 已移入此处，
+        # 它放在仓外本就无法被 uses: 引用（reusable 必须位于 .github/workflows/）。
+        # 保持「所有 workflow 都在扫描范围内」这个不变式，不要再在别处新建。
         run: pipx run "zizmor==${ZIZMOR_VERSION}" .github/
