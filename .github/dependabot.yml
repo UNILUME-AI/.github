@@ -9,6 +9,11 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # 冷却期：不追刚发布的版本。被投毒的发布最危险的窗口就是刚上线那几天——
+    # 等 7 天让社区先踩，是这类供应链攻击最便宜的缓解手段。zizmor 的
+    # dependabot-cooldown 审计会强制这一条。
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
