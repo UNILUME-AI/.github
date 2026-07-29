@@ -1,0 +1,59 @@
+# 本仓的机器门。此前完全没有 CI——而它托管的 reusable workflow 被 14 处引用，
+# 任何改动都会未经检查地进入其余仓的流水线；仓库转公开后这一点更实在。
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # 每周重扫。注意两个扫描器版本都是钉死的，**新增的规则不会自动生效**（要改下面的
+    # ACTIONLINT_/ZIZMOR_ 版本）。重扫的价值在别处：zizmor 的联网审计会随上游变化——
+    # tag 被重新指向、仓库被归档、上游改了发布——同一份配置这周绿不代表下周仍绿。
+    - cron: '0 2 * * 1'
+  workflow_dispatch: {}
+
+# 权限逐 job 最小授予。
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # job 名须在本仓所有 workflow 中唯一：必需状态检查匹配的是 job 名而非 workflow 名。
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # 实测秒级；显式设置避免卡死作业按默认 360 分钟计费
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 不加 paths-filter。本仓几乎全部内容就是 workflow 定义，过滤省不下什么，却要维护
+      # 「过滤范围 ⊇ 扫描范围」这个不变式——一旦分叉，症状是「跳过了但报 success」，
+      # 是最难发现的一类失败。本组织刚在这上面栽过，这里直接不给它机会。
+      - name: actionlint
+        env:
+          # 用官方镜像并钉 digest：`curl | bash` 装工具本身就是供应链缺口（zizmor 的
+          # unpinned-tools 也会拦）。刷新：docker buildx imagetools inspect rhysd/actionlint:<ver>
+          IMAGE: rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo "$IMAGE" -color
+
+      - name: zizmor
+        env:
+          # Bump to the latest release at https://pypi.org/project/zizmor/ before pinning.
+          ZIZMOR_VERSION: '1.26.1'
+          # 必需。ref-version-mismatch、impostor-commit 等审计要联网反查 SHA 对应哪个 tag。
+          # 缺令牌时 zizmor 不报错也不警告，而是把这些审计计入 "suppressed" 后以 0 退出，
+          # 日志里只留一句 `No findings to report (N suppressed)`——与「扫过了，很干净」在
+          # 界面上无法区分。本组织确曾因此让版本注释腐化一路绿灯合入；判断依据就是那个
+          # suppressed 计数，它不为 0 就说明有审计根本没跑。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # 只传 .github/：zizmor 按 `.github/workflows/` 这个结构收集输入，仓根的
+        # workflows/ 目录传进去会报 "no inputs collected" 直接失败。那个目录里的
+        # reusable-ts-machine-gate.yml 因此既扫不到、也不会被 GitHub 当 workflow 运行
+        # （reusable 必须放在 .github/workflows/ 才能被 uses: 引用）——已另行记录。
+        run: pipx run "zizmor==${ZIZMOR_VERSION}" .github/
