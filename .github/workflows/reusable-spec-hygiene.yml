@@ -1,0 +1,166 @@
+name: reusable-spec-hygiene
+
+# 防腐门 (anti-corrosion gate) for `specs/NNN/` artifacts, shared via workflow_call.
+# It is the CI backstop the constitution already requires but never had: 铁律 VI.3 asks for
+# frontmatter (owner/status/last_reviewed) plus "由 CI 检测失效链接与超期未复审", and 铁律 VII
+# says a rule without a CI or PR gate behind it is not a rule. Until this file existed, VI.3
+# was itself an unbacked rule — and it decayed exactly as VII predicts: 32 of 45 specs across
+# the org still said `status: draft`, several of them for features that had shipped weeks
+# earlier, and every `last_reviewed` was frozen at the day the spec was created.
+#
+# A business repo wires it as a REQUIRED check:
+#
+#   # .github/workflows/ci.yml
+#   jobs:
+#     spec-hygiene:
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-spec-hygiene.yml@<full-sha>
+#
+# The whole check is inlined below rather than shipped as a script. A reusable workflow runs
+# from THIS repo while `actions/checkout` gets the CALLER's repo, so a script would need a
+# second checkout of this repo at a matching ref — two things to pin instead of one, and a
+# silent skew the day they disagree. Inline keeps "one SHA pins everything" true.
+#
+# Pure filesystem checks: no network, no secrets, works on the default GITHUB_TOKEN and on
+# fork PRs. Inputs reach bash through env, never interpolated into `run:`.
+
+on:
+  workflow_call:
+    inputs:
+      specs-dir:
+        description: Root holding the per-feature spec directories.
+        type: string
+        default: specs
+      stale-days:
+        description: Age at which `last_reviewed` is reported as overdue (warning only).
+        type: number
+        default: 90
+
+permissions:
+  contents: read
+
+jobs:
+  spec-hygiene:        # job id = 状态检查上下文(与分支保护对齐)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # 默认 360 分钟；卡死作业会按 6 小时计费
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # 需要 base 与 head 才能 diff 出本次改了哪些 spec
+          # 不把 git 凭证留在 .git/config：残留凭证会被后续 step 或 artifact 带走（zizmor artipacked）。
+          persist-credentials: false
+
+      # 阻断项只看本次 PR 改到的 spec。存量不合规的那些由一次性整理修，不该让每个无关 PR 都红——
+      # 那样门会被当成噪音关掉，而不是被遵守。
+      - name: Validate changed specs
+        env:
+          SPECS_DIR: ${{ inputs.specs-dir }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          # 与 scrum 的 Theme/Epic 词表同源，另加两个 spec 独有态：
+          #   superseded — 实现已走过这份规格冻结的决定（正文加注，规格本身不改写）
+          #   moved      — 规格已随其描述的代码迁往他仓，本仓只留索引
+          VALID='^(proposed|active|paused|done|abandoned|superseded|moved)$'
+          FAIL=0
+          fail(){ echo "::error file=$1::$2"; FAIL=1; }
+          warn(){ echo "::warning file=$1::$2"; }
+
+          field(){ sed -n '1,20p' "$1" | grep -m1 "^$2:" | sed -E "s/^$2:[[:space:]]*//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]*$//"; }
+
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "$SPECS_DIR" | grep -E '\.md$' || true)"
+          if [ -z "${changed//[[:space:]]/}" ]; then
+            echo "no spec docs changed — nothing to block on"
+            exit 0
+          fi
+          echo "changed spec docs:"; echo "$changed"
+
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue                      # 本次删除的文件不必校验
+            case "$(basename "$f")" in README.md) continue;; esac
+
+            # 未决标记不得进主干。这条在只有部分仓跑 vale 的现状下尤其要放在这里，
+            # 否则它只在装了 docs-style 的仓被拦。
+            if grep -q '\[NEEDS CLARIFICATION' "$f"; then
+              fail "$f" "residual [NEEDS CLARIFICATION] marker(s)"
+            fi
+
+            # frontmatter 三字段只对 spec.md 要求：plan/tasks/research 是派生件，
+            # 状态由所属 spec.md 承载，逐个文件都要一份反而会各自漂移。
+            case "$(basename "$f")" in
+              spec.md) ;;
+              *) continue;;
+            esac
+
+            st="$(field "$f" status)"; ow="$(field "$f" owner)"; lr="$(field "$f" last_reviewed)"
+            [ -n "$st" ] || fail "$f" "frontmatter 缺 status"
+            [ -n "$ow" ] || fail "$f" "frontmatter 缺 owner"
+            [ -n "$lr" ] || fail "$f" "frontmatter 缺 last_reviewed"
+            if [ -n "$st" ] && ! echo "$st" | grep -qE "$VALID"; then
+              fail "$f" "status 取值非法 '$st'（可用：proposed active paused done abandoned superseded moved）"
+            fi
+            # 日期必须可比较，否则超期检查会静默失效——一个永不触发的检查比没有更糟。
+            if [ -n "$lr" ] && ! echo "$lr" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+              fail "$f" "last_reviewed 非 YYYY-MM-DD '$lr'"
+            fi
+          done <<< "$changed"
+
+          [ "$FAIL" -eq 0 ] || { echo "::error::spec 防腐门未通过"; exit 1; }
+          echo "changed specs OK"
+
+      # 全量扫描只报不拦：让存量腐化持续可见，而不是把它藏进一次性任务里。
+      #
+      # 这一步用 python3 而不是 bash + date。`date -u -d` 是 GNU 语法，在 runner 上能跑但在
+      # macOS 的 BSD date 上直接报错——也就是说这段逻辑本地无法忠实预演，而一个只在 CI 里
+      # 跑过的日期比较很容易是恒不触发的（那比没有这个检查更糟：它看起来在守着）。python3
+      # 在 ubuntu-latest 与开发机上都有，同一份代码两地同结果，所以本地测就等于测了 CI。
+      - name: Report stale specs (non-blocking)
+        if: always()
+        env:
+          SPECS_DIR: ${{ inputs.specs-dir }}
+          STALE_DAYS: ${{ inputs.stale-days }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, datetime
+          root = pathlib.Path(os.environ["SPECS_DIR"])
+          limit = int(os.environ["STALE_DAYS"])
+          today = datetime.date.today()
+
+          def field(text, key):
+              for line in text.splitlines()[:20]:
+                  if line.startswith(key + ":"):
+                      return line[len(key) + 1:].strip().strip("\"'")
+              return ""
+
+          rows = []
+          for f in sorted(root.rglob("spec.md")) if root.is_dir() else []:
+              text = f.read_text(encoding="utf-8", errors="replace")
+              st, lr = field(text, "status"), field(text, "last_reviewed")
+              flags, days = [], None
+              if not st:
+                  flags.append("缺 status")
+              if not lr:
+                  flags.append("缺 last_reviewed")
+              else:
+                  try:
+                      days = (today - datetime.date.fromisoformat(lr)).days
+                      if days > limit:
+                          flags.append(f"超期 {limit} 天")
+                  except ValueError:
+                      flags.append(f"last_reviewed 不可解析 '{lr}'")
+              if flags:
+                  rows.append((str(f), st or "∅", lr or "∅", days, " / ".join(flags)))
+
+          summary = pathlib.Path(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout"))
+          with summary.open("a", encoding="utf-8") as out:
+              out.write("### spec 防腐扫描\n\n")
+              if not rows:
+                  out.write("全部 spec 的 status 与 last_reviewed 均合规。\n")
+              else:
+                  out.write("| spec | status | last_reviewed | 天数 | 问题 |\n|---|---|---|---|---|\n")
+                  for p, st, lr, days, why in rows:
+                      out.write(f"| `{p}` | {st} | {lr} | {days if days is not None else '—'} | {why} |\n")
+          for p, _, _, _, why in rows:
+              print(f"::warning file={p}::{why}")
+          print(f"需关注的 spec: {len(rows)}")
+          PY
