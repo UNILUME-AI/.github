@@ -58,62 +58,91 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
-          # 与 scrum 的 Theme/Epic 词表同源，另加两个 spec 独有态：
-          #   superseded — 实现已走过这份规格冻结的决定（正文加注，规格本身不改写）
-          #   moved      — 规格已随其描述的代码迁往他仓，本仓只留索引
-          VALID='^(proposed|active|paused|done|abandoned|superseded|moved)$'
-          FAIL=0
-          fail(){ echo "::error file=$1::$2"; FAIL=1; }
-          warn(){ echo "::warning file=$1::$2"; }
-
-          field(){ sed -n '1,20p' "$1" | grep -m1 "^$2:" | sed -E "s/^$2:[[:space:]]*//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]*$//"; }
-
           changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "$SPECS_DIR" | grep -E '\.md$' || true)"
           if [ -z "${changed//[[:space:]]/}" ]; then
             echo "no spec docs changed — nothing to block on"
             exit 0
           fi
           echo "changed spec docs:"; echo "$changed"
+          CHANGED="$changed" python3 - <<'PY'
+          import os, pathlib, re, datetime, sys
 
-          while IFS= read -r f; do
-            [ -f "$f" ] || continue                      # 本次删除的文件不必校验
-            case "$(basename "$f")" in README.md) continue;; esac
+          # 与 scrum 的 Theme/Epic 词表同源，另加两个 spec 独有态：
+          #   superseded — 实现已走过这份规格冻结的决定（正文加注，规格本身不改写）
+          #   moved      — 规格已随其描述的代码迁往他仓，本仓只留索引
+          VALID = {"proposed", "active", "paused", "done", "abandoned", "superseded", "moved"}
+          LINK = re.compile(r'\]\(([^)\s#]+\.md)(#[^)]*)?\)')
 
-            # 未决标记不得进主干。这条在只有部分仓跑 vale 的现状下尤其要放在这里，
-            # 否则它只在装了 docs-style 的仓被拦。
-            if grep -q '\[NEEDS CLARIFICATION' "$f"; then
-              fail "$f" "residual [NEEDS CLARIFICATION] marker(s)"
-            fi
+          fail = 0
+          def bad(f, msg):
+              global fail
+              print(f"::error file={f}::{msg}")
+              fail = 1
 
-            # frontmatter 三字段只对 spec.md 要求：plan/tasks/research 是派生件，
-            # 状态由所属 spec.md 承载，逐个文件都要一份反而会各自漂移。
-            case "$(basename "$f")" in
-              spec.md) ;;
-              *) continue;;
-            esac
+          def field(text, key):
+              for line in text.splitlines()[:20]:
+                  if line.startswith(key + ":"):
+                      return line[len(key) + 1:].strip().strip("\"'")
+              return ""
 
-            st="$(field "$f" status)"; ow="$(field "$f" owner)"; lr="$(field "$f" last_reviewed)"
-            [ -n "$st" ] || fail "$f" "frontmatter 缺 status"
-            [ -n "$ow" ] || fail "$f" "frontmatter 缺 owner"
-            [ -n "$lr" ] || fail "$f" "frontmatter 缺 last_reviewed"
-            if [ -n "$st" ] && ! echo "$st" | grep -qE "$VALID"; then
-              fail "$f" "status 取值非法 '$st'（可用：proposed active paused done abandoned superseded moved）"
-            fi
-            # 日期必须可比较，否则超期检查会静默失效——一个永不触发的检查比没有更糟。
-            if [ -n "$lr" ] && ! echo "$lr" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
-              fail "$f" "last_reviewed 非 YYYY-MM-DD '$lr'"
-            fi
-          done <<< "$changed"
+          for name in os.environ["CHANGED"].split("\n"):
+              name = name.strip()
+              if not name:
+                  continue
+              f = pathlib.Path(name)
+              if not f.is_file():          # 本次删除的文件不必校验
+                  continue
+              if f.name == "README.md":
+                  continue
+              text = f.read_text(encoding="utf-8", errors="replace")
 
-          [ "$FAIL" -eq 0 ] || { echo "::error::spec 防腐门未通过"; exit 1; }
-          echo "changed specs OK"
+              # 未决标记不得进主干。放在这里而不是靠 vale，是因为只有部分仓装了 docs-style。
+              if "[NEEDS CLARIFICATION" in text:
+                  bad(f, "residual [NEEDS CLARIFICATION] marker(s)")
+
+              # 失效相对链接。全组织现存 119 条相对链接、0 条失效，所以设为阻断级今天零成本；
+              # 若哪天它开始误伤（例如指向尚未落地的兄弟文件），降级为告警而不是关掉整道门。
+              for m in LINK.finditer(text):
+                  target = m.group(1)
+                  if target.startswith(("http://", "https://", "/")):
+                      continue
+                  if not (f.parent / target).exists():
+                      bad(f, f"失效相对链接 → {target}")
+
+              # frontmatter 三字段只对 spec.md 要求：plan/tasks/research 是派生件，
+              # 状态由所属 spec.md 承载，逐个文件各带一份反而会各自漂移。
+              if f.name != "spec.md":
+                  continue
+
+              st, ow, lr = field(text, "status"), field(text, "owner"), field(text, "last_reviewed")
+              if not st:
+                  bad(f, "frontmatter 缺 status")
+              elif st not in VALID:
+                  bad(f, f"status 取值非法 '{st}'（可用：{' '.join(sorted(VALID))}）")
+              if not ow:
+                  bad(f, "frontmatter 缺 owner")
+              if not lr:
+                  bad(f, "frontmatter 缺 last_reviewed")
+              else:
+                  # 必须做日历语义校验，不能只比形状。'2026-02-31' 能过 \d{4}-\d{2}-\d{2}，
+                  # 却在超期计算里抛 ValueError——那条 spec 从此永远不会被判超期，而门是绿的。
+                  # 一个恒不触发的检查比没有检查更糟：它看起来在守着。
+                  try:
+                      datetime.date.fromisoformat(lr)
+                  except ValueError:
+                      bad(f, f"last_reviewed 不是合法日历日期 '{lr}'（需 YYYY-MM-DD）")
+
+          if fail:
+              print("::error::spec 防腐门未通过")
+              sys.exit(1)
+          print("changed specs OK")
+          PY
 
       # 全量扫描只报不拦：让存量腐化持续可见，而不是把它藏进一次性任务里。
       #
-      # 这一步用 python3 而不是 bash + date。`date -u -d` 是 GNU 语法，在 runner 上能跑但在
-      # macOS 的 BSD date 上直接报错——也就是说这段逻辑本地无法忠实预演，而一个只在 CI 里
-      # 跑过的日期比较很容易是恒不触发的（那比没有这个检查更糟：它看起来在守着）。python3
-      # 在 ubuntu-latest 与开发机上都有，同一份代码两地同结果，所以本地测就等于测了 CI。
+      # 两个步骤都用 python3 而非 bash + date。`date -u -d` 是 GNU 语法，在 runner 上能跑但在
+      # macOS 的 BSD date 上直接报错——也就是说日期逻辑本地无法忠实预演。python3 在
+      # ubuntu-latest 与开发机上都有，同一份代码两地同结果，所以本地测就等于测了 CI。
       - name: Report stale specs (non-blocking)
         if: always()
         env:
@@ -123,7 +152,9 @@ jobs:
           python3 - <<'PY'
           import os, pathlib, datetime
           root = pathlib.Path(os.environ["SPECS_DIR"])
-          limit = int(os.environ["STALE_DAYS"])
+          # workflow_call 的 `type: number` 允许小数，调用方给 90.5 是合法输入。直接 int()
+          # 会抛 ValueError 并让这个「非阻断」步骤把整个 job 弄红——报告用的检查反而成了门。
+          limit = int(float(os.environ["STALE_DAYS"]))
           today = datetime.date.today()
 
           def field(text, key):
