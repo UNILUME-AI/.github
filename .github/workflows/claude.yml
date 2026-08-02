@@ -15,8 +15,12 @@ on:
   issues:
     types: [opened, assigned]
 
+# 本仓也是 reusable-claude 的一个 caller,故须与其余消费仓同样声明 actions/checks——
+# reusable 的 permissions 受 caller 上限截断,caller 不写就是 none,被调方声明多少都无效。
 permissions:
   contents: write
+  actions: write # github_ci MCP(CI 状态/日志) + Actions 缓存写入
+  checks: read # 读 Check 注解(SonarCloud 等)
   pull-requests: write
   issues: write
   id-token: write
