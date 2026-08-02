@@ -19,7 +19,7 @@ on:
 # reusable 的 permissions 受 caller 上限截断,caller 不写就是 none,被调方声明多少都无效。
 permissions:
   contents: write
-  actions: write # github_ci MCP(CI 状态/日志) + Actions 缓存写入
+  actions: read # github_ci MCP(CI 状态/日志)
   checks: read # 读 Check 注解(SonarCloud 等)
   pull-requests: write
   issues: write
