@@ -9,7 +9,7 @@
 #     issues: { types: [opened, assigned] }
 #   permissions:
 #     contents: write
-#     actions: write
+#     actions: read
 #     checks: read
 #     pull-requests: write
 #     issues: write
@@ -31,11 +31,9 @@
 #     issue_comment / PR-review triggers locally.
 #   - id-token: write must be granted at the CALLER level: a reusable workflow's permissions are
 #     capped by the caller's ceiling and cannot be elevated beyond it.
-#   - actions: write enables the github_ci MCP server (CI status / job logs) AND lets the runner
-#     write the Actions cache (setup-bun's `bun install` layer). With only `read`, every run ends
-#     in "Cache reservation failed: cache write denied: token has no writable scopes" and redoes
-#     ~8s of install work. Same capping rule: declare it here AND grant it in the caller, else it
-#     falls back to none.
+#   - actions: read enables the github_ci MCP server (CI status / job logs). Same capping rule:
+#     declare it here AND grant it in the caller, else it falls back to none. Do not raise it to
+#     write for the cache warning's sake — see the note above the "Run Claude Code" step.
 #   - checks: read lets @claude read Check annotations (e.g. SonarCloud findings) via gh api.
 #     Same capping rule: declare here AND in the caller.
 # Needs secret CLAUDE_CODE_OAUTH_TOKEN (org secret, all-repos visible); callers pass it
@@ -69,10 +67,7 @@ jobs:
     timeout-minutes: 60 # 默认 360 分钟；卡死作业会按 6 小时计费
     permissions:
       contents: write
-      # write(而非 read):除 github_ci MCP 外，Actions 缓存的写入也走这个 scope。只给 read 时
-      # 每次运行都以 "cache write denied: token has no writable scopes" 收尾，setup-bun 那层
-      # ~8s 的 install 白做一遍。caller 必须同样授予，否则被上限截回 none。
-      actions: write # github_ci MCP(CI 状态/日志) + Actions 缓存写入;caller 必须同样授予
+      actions: read # github_ci MCP(CI 状态/日志);caller 必须同样授予，否则被上限截回 none
       checks: read # lets @claude read Check annotations (e.g. SonarCloud findings); caller must grant it too
       pull-requests: write
       issues: write
@@ -107,6 +102,11 @@ jobs:
           git -C "$RUNNER_TEMP/agent-kit" fetch -q --depth 1 origin "$AGENT_KIT_SHA"
           git -C "$RUNNER_TEMP/agent-kit" checkout -q FETCH_HEAD
 
+      # 已知 warning，刻意不管:"cache write denied: token has no writable scopes"。
+      # 缓存来自 action 内部的 setup-bun，它没透传 no-cache;提 permissions 无效——凭据是
+      # runner 侧的 ACTIONS_RUNTIME_TOKEN，低信任触发器(本 workflow 全部触发器)只读。
+      # 唯一绕法是自装 bun 走 path_to_bun_executable，代价是硬绑 bun 版本且错配不报错，
+      # 只为省每次约 8s，不值。
       - name: Run Claude Code
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         with:
