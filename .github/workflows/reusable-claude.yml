@@ -5,8 +5,14 @@
 #   on:
 #     issue_comment: { types: [created] }
 #     pull_request_review_comment: { types: [created] }
-#     pull_request_review: { types: [submitted] }
 #     issues: { types: [opened, assigned] }
+#     # Do NOT add pull_request_review: an automated reviewer fires one per submitted review, the
+#     # job is skipped by the @claude filter, but GitHub still creates a check run for the skipped
+#     # job and its run attaches to the PR head SHA — so every review leaves a "claude / claude
+#     # Skipped" row in the PR's checks list. issue_comment and issues attach to the default-branch
+#     # SHA and stay out of that list. pull_request_review_comment does attach to the PR head SHA
+#     # and is kept as a trade-off: it is the only trigger for which claude-code-action replies via
+#     # createReplyForReviewComment, keeping @claude's answer inside the same review thread.
 #   permissions:
 #     contents: write
 #     actions: read

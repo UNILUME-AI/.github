@@ -5,13 +5,19 @@ name: Claude Code
 # 权限 + 委派。触发器与 id-token 权限必须留在各仓本地(GitHub 只跑仓库内的事件 workflow,
 # org .github 不下发 workflow;reusable 不能提权超过 caller 上限)。
 # 注意:issue_comment 类触发要求本 workflow 先在默认分支才生效。
+#
+# 不监听 pull_request_review(submitted):Codex 每提交一份自动评审就触发一次,job 因 @claude
+# 过滤被跳过,但 GitHub 仍会为跳过的 job 建 check run,在 PR 上留下一条 "claude / claude
+# Skipped"。该事件的 run 挂在 PR head SHA 上,噪音直接进 checks 列表;issue_comment / issues
+# 的 run 挂在默认分支 SHA 上,不进 PR checks,故保留。pull_request_review_comment 同样挂 PR
+# head SHA,保留它是取舍:自动评审带行内意见时每条各触发一次,噪音并未清零(只是不再叠加
+# "提交整份 review"那一次);换来的是 claude-code-action 对该事件走
+# createReplyForReviewComment,@claude 的回复留在同一条 review thread 内,便于就地 resolve。
 on:
   issue_comment:
     types: [created]
   pull_request_review_comment:
     types: [created]
-  pull_request_review:
-    types: [submitted]
   issues:
     types: [opened, assigned]
 
