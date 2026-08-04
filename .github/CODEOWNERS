@@ -1,0 +1,16 @@
+# 本文件只做「自动把 PR 推到对的人眼前」，不做拦截。
+# 分支保护(ruleset main-baseline)里 require_code_owner_review 保持 false——GitHub 不允许
+# PR 作者批准自己的 PR，本组织多数仓只有一个活跃作者，开了会永久卡死。
+# 该开关随第一个员工拿到 write 之前翻成 true，在那之前保持 false 是正确的，不是遗漏。
+#
+# ⚠️ 刻意不写 `*` 默认行：本仓日常改动不需要指定负责人。写了默认行，等开关翻开之后
+#    每个 PR 都要 owner 批准，会直接拖慢开发——而本仓真正需要把关的只有下面这几条路径。
+#
+# ── 为什么锁 workflows ────────────────────────────────────
+# 给某人本仓 write，等于给了本仓的整个 CI 身份，他不需要任何其他仓的权限：
+# workflow 里的 environment + id-token: write 能换出 OIDC 短期令牌去 assume AWS 角色。
+# 凭证不在 GitHub 侧（本仓 repo-level secrets 为 0），所以攻击面不是「偷密钥」，
+# 而是「借本仓的身份现换凭证」——改一行 workflow 就够。
+
+/.github/workflows/                                @Anskyuan
+/.github/CODEOWNERS                                @Anskyuan
