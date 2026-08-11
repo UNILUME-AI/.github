@@ -1,0 +1,39 @@
+name: dependabot-auto-merge
+
+# Dependabot 的依赖更新 PR 在必需检查全绿后自动合并，不再逐个人工点。安全性由分支保护的
+# 必需检查背书——其中 zizmor-scan 审计的 ref-version-mismatch 与 impostor-commit 正是 SHA
+# 钉法最该验的两件事；任一必需检查不过，auto-merge 就永远不会触发。
+#
+# 只对本仓 .github/dependabot.yml 声明的生态生效（当前仅 github-actions，npm/pip 未开）。
+#
+# 无 paths 过滤：本 workflow 不是必需检查，加 paths 只会让非 Dependabot 的 PR 上少一个
+# skip 记录，收益为零；而写错 paths 会让它对某些依赖更新静默失灵，反而难查。
+
+on:
+  pull_request:
+
+# 权限逐 job 最小授予。
+permissions: {}
+
+jobs:
+  # job 名必须在本仓所有 workflow 中唯一：必需状态检查匹配的是 job 名而非 workflow 名，
+  # 同名 job 会造成检查结果歧义并阻塞合并。
+  dependabot-auto-merge:
+    # 只认 Dependabot 本人。触发器是 pull_request 而非 pull_request_target，PR 分支的代码
+    # 不参与本 job 执行，故不存在 fork 提权面。
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # 单次 API 调用，秒级完成；显式设置避免卡死作业按默认 360 分钟计费
+    permissions:
+      contents: write # 合并提交
+      pull-requests: write # 置 auto-merge 标志
+    steps:
+      # --auto 只是"挂上待合并"，真正的合并由 GitHub 在必需检查全绿后执行；检查红则 PR 原地
+      # 留着等人处理。--squash 必须与分支保护的 allowed_merge_methods 一致，写 --merge 会被拒。
+      - name: 挂上 auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          # Dependabot 触发的 workflow 里 GITHUB_TOKEN 默认降为只读，上面那个 permissions 块
+          # 是把它提回可写的唯一途径。删掉它不会报配置错，而是在合并调用时才 403。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
