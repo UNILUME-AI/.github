@@ -205,6 +205,11 @@ jobs:
           main_marker() {
             local body
             if body=$(gh api "repos/$repo/contents/$file?ref=main" -H "Accept: application/vnd.github.raw" 2>/tmp/gh-err); then
+              # 同上：多条同生产方记号时取首个是在猜，宁可停下。
+              if [ "$(printf '%s\n' "$body" | grep -c "${producer}@" || true)" -gt 1 ]; then
+                echo "::error::$file 里有多条 $producer 的源提交记号，无法判断新旧" >&2
+                return 1
+              fi
               if [[ "$body" =~ ${producer}@([0-9a-f]{7,}) ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
               return 0
             fi
@@ -260,6 +265,11 @@ jobs:
           head = f'# 源提交（本行由 {producer} 的发布流水线自动维护，取记号以它为准）：'
           line = head + producer + '@' + sha
           mark = re.compile('^' + re.escape(head + producer) + r'@[0-9a-f]{7,}$', re.M)
+          # 记号按生产方而不是按键区分，故同一份文件里同一生产方只能有一条。今天的四个消费方
+          # 各占一个键、互不同名，pipelines 的两个键还跨两份文件，所以撞不上。真撞上时**大声
+          # 失败**而不是改错那一条——届时再决定是把记号按键限定，还是把键拆到不同文件。
+          if len(mark.findall(new)) > 1:
+              sys.exit(f'{p} 里有多条 {producer} 的源提交记号，无法判断该更新哪一条')
           if mark.search(new):
               new = mark.sub(lambda m: line, new, count=1)
           else:
