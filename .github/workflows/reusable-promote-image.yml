@@ -1,0 +1,418 @@
+# Reusable: 把刚构建的镜像摘要提成基础设施仓的一个滚动 PR（防腐：逻辑只有一份）。
+#
+# 生产方仓构建并推完镜像后调用本工作流，它去改基础设施仓里钉着该镜像的那一行 tfvars，并把
+# 改动提成一个**滚动 PR**（固定分支、强推更新），于是换版本始终是一次可审的提交，而不必有人
+# 记得去手工改 tfvars。缘由与备选方案见
+# https://github.com/UNILUME-AI/platform/issues/277
+#
+# 用法（调用方只留自己特有的部分）：
+#
+#   jobs:
+#     handoff:
+#       needs: [build-push, migrate]      # migrate 可无
+#       if: ${{ !cancelled() && needs.build-push.result == 'success' }}
+#       # 按 commit SHA 钉（Sonar 供应链规则：可变的 @main 过不了门）。取 SHA：
+#       #   gh api repos/UNILUME-AI/.github/commits/main --jq .sha
+#       # 行尾不要写日期或版本注释：自家 reusable 没有版本 tag，Dependabot 会更新 SHA 而注释
+#       # 原地不动，两者永久对不上（2026-08-11 已全 org 清理过一轮这种注释）。
+#       uses: UNILUME-AI/.github/.github/workflows/reusable-promote-image.yml@<commit-sha>
+#       with:
+#         image:            ${{ needs.build-push.outputs.image }}
+#         tfvars-path:      infra-substrate/aws/envs/dev/dev.tfvars
+#         tfvars-key:       unilume_api_image
+#         target-branch:    api-image/latest
+#         pr-title-prefix:  'chore(aws/envs): dev 的 unilume-api 镜像摘要'
+#         migration-result: ${{ needs.migrate.result }}   # 没有结构变更作业就别传
+#         verify-hint:      '合并并 apply 之后 `curl -s https://api.dev.unilume.com/version` 应返回本 PR 标题里的那个提交。'
+#       secrets:
+#         # 显式传，不用 `secrets: inherit`——最小权限，且 Sonar 会标记无差别 inherit。
+#         PROMOTE_TOKEN: ${{ secrets.SCRUM_TOKEN }}
+#
+# 调用方为什么还得自己写 needs / if（挪不进来）：
+#   - `needs` 指的是调用方自己的作业名，本工作流看不见也管不着；
+#   - 上游被**取消**时（并发组顶掉排队作业）`needs` 默认会把本作业一并跳过，那件事就此无声。
+#     调用方用 `if: !cancelled() && …` 放行进来，本工作流再按 migration-result 分诊并大声失败。
+#
+# 令牌要求：对基础设施仓有写权限，且**不能用默认 GITHUB_TOKEN**——它既不能跨仓写，开的 PR 也
+# 不触发任何 workflow（GitHub 的防循环机制），那样对方的必需 check 会永远停在 pending。
+
+name: reusable promote image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "镜像的摘要引用，形如 <仓库>/<名字>@sha256:…。必须是摘要不是标签：tfvars 按摘要钉。"
+        type: string
+        required: true
+      tfvars-path:
+        description: "基础设施仓里那份 tfvars 的仓内路径。"
+        type: string
+        required: true
+      tfvars-key:
+        description: "tfvars 里钉该镜像的变量名，如 unilume_api_image。找不到这一行即非零退出。"
+        type: string
+        required: true
+      target-branch:
+        description: "滚动 PR 的固定分支名，如 api-image/latest。每个消费方各用一条，不要共用。"
+        type: string
+        required: true
+      pr-title-prefix:
+        description: "PR 标题前半段；本工作流会接上「跟到 <生产方仓>@<短SHA>」。"
+        type: string
+        required: true
+      migration-result:
+        description: "结构变更作业的 result。留空 = 调用方没有这种作业，整段分诊不适用。"
+        type: string
+        required: false
+        default: ""
+      verify-hint:
+        description: "追加到 PR 正文的一句验证提示。留空则不写。"
+        type: string
+        required: false
+        default: ""
+      platform-repo:
+        description: "基础设施仓。"
+        type: string
+        required: false
+        default: UNILUME-AI/platform
+    secrets:
+      PROMOTE_TOKEN:
+        required: true
+
+jobs:
+  promote:
+    name: 提 PR 更新镜像摘要
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 既不碰云也不检出调用方的仓：gh 与随后的 git push 全由 PROMOTE_TOKEN 认证，默认令牌一个
+    # 动作都不参与，故一项权限都不授予。
+    permissions: {}
+    # 刻意不设并发闸：GitHub 每个并发组只保留一个 pending 作业，新的进来会顶掉排队那个，于是
+    # 「旧的在跑、最新的排队、中间的进来」会把最新的丢掉。串行化改由推送处的比较并交换承担。
+    steps:
+      - name: 提 PR
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
+          IMAGE: ${{ inputs.image }}
+          SHA: ${{ github.sha }}
+          MIGRATION: ${{ inputs.migration-result }}
+          PLATFORM_REPO: ${{ inputs.platform-repo }}
+          TFVARS_PATH: ${{ inputs.tfvars-path }}
+          TFVARS_KEY: ${{ inputs.tfvars-key }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+          TITLE_PREFIX: ${{ inputs.pr-title-prefix }}
+          VERIFY_HINT: ${{ inputs.verify-hint }}
+        run: |
+          set -euo pipefail
+          repo=$PLATFORM_REPO
+          # 生产方仓名，用于记号前缀与提交说明。取调用方的仓——workflow_call 里 github 上下文属调用方。
+          producer=${GITHUB_REPOSITORY##*/}
+          # **只更 dev。** 环境梯队是 dev→qa→prod 逐级提升，越靠近生产越应当保持显式提升；
+          # 其它环境何时提升由人决定，要跟进时手工改对应环境的 tfvars。
+          file=$TFVARS_PATH
+          short=${SHA:0:8}
+          branch=$TARGET_BRANCH
+
+          # **空摘要必须在这里停下。** 上游取不到摘要就已经整轮失败，正常情况下轮不到这条；但真
+          # 漏过来的话，下面的替换会往 tfvars 里写一个空串，而那是个语法合法的赋值——apply 会拿
+          # 空镜像去登记任务定义，dev 的服务随之拉不起来。宁可在这里失败。
+          if [ -z "$IMAGE" ]; then
+            echo "::error::上游没有传出镜像摘要，拒绝改 tfvars"
+            exit 1
+          fi
+
+          # **只有主干尖端才发布**，与 release-dev 的 `tip` 步骤同构。光靠 `needs: release-dev`
+          # 不够：那个作业在自己不是尖端时会跳过全部迁移步骤并以成功结束，它的成功因此不等于
+          # 迁移跑过。两道判据都不满足时谁也不发布，dev 停在上一个镜像与结构相互一致的版本上；
+          # 恢复靠下一次合并，或手动触发本工作流。
+          #
+          # **在开头与每次推送前各判一次。** 只判开头的话，克隆与重试期间主干前进就没人再看，
+          # 这个不变式于是只在开头成立——半执行的不变式比不执行更难推理。
+          yield_unless_tip() {
+            local tip
+            tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha 2>/dev/null || true)
+            if [ -z "$tip" ]; then
+              echo "::error::取不到主干尖端，无法判断本次是否已被更新的提交取代，拒绝推送以免发布落后于结构变更的镜像"
+              exit 1
+            fi
+            if [ "$tip" != "$SHA" ]; then
+              echo "::notice::主干已前进到 ${tip:0:8}，本次（$short）不再发布，交给尖端那次"
+              exit 0
+            fi
+          }
+          yield_unless_tip
+
+          # 结构变更的结果分诊。**放在尖端判据之后**：非尖端的那些运行本就该安静让出，只有尖端
+          # 这一次的迁移没跑才值得报出来。cancelled = 被 release-dev 的并发组顶掉，迁移根本没执行
+          # 且别处不会报，故大声失败；其余非 success 时那个作业自己已经是红的，这里只记一笔。
+          # 入参为空 = 调用方没有结构变更作业（如 pipelines），整段不适用。
+          if [ -n "$MIGRATION" ] && [ "$MIGRATION" != success ]; then
+            if [ "$MIGRATION" = cancelled ]; then
+              echo "::error::dev 的结构变更作业被取消，本次（$short）的迁移没有执行，故不发布镜像。重跑本工作流即可"
+              exit 1
+            fi
+            echo "::notice::dev 的结构变更未成功（$MIGRATION），不发布镜像"
+            exit 0
+          fi
+
+          # ── 读滚动分支与历史记号 ─────────────────────────────────────────────────
+          #
+          # **必须区分「查得到但没有记号」与「根本没查到」。** 两者都表现为空字符串，含义却相反：
+          # 前者正常（首次运行，或分支已随上一轮合并被删而 main 的历史里尚无记号），后者是接口
+          # 失败。若把失败当成前者，先后判定会被整块跳过，旧运行于是能拿旧摘要覆盖滚动分支。
+          #
+          # ⚠ **「分支不存在」的实测状态码是 422（`No commit found for SHA`）而不是 404**，而那正是
+          # 滚动 PR 合并后（platform 开了合并即删分支）每次都会走到的路径。只放行 404 会让合并之后
+          # 的第一次运行必然误判成接口故障。404 一并放行（仓或路径不存在）。
+          #
+          # 取值用 bash 自带正则而不是 `sed … | head -1`：后者在输入较大时会让 sed 吃到 SIGPIPE，
+          # 而 pipefail 下那是退出码 141、会被当成查询失败（实测五千行即触发，回落那条查的是
+          # per_page=100）。纯正则零子进程零管道，不存在这个问题。
+
+          # 滚动分支的头。**sha、标题与记号必须同一次调用取回**：分两次读的话，两次之间分支可能已
+          # 被别的运行推动，于是租约用的是新值、先后判的是旧记号，恰好把下面那道比较并交换绕过去。
+          read_branch() { # 成功返 0 并设置 branch_sha / branch_subject / branch_marker；查询失败返 1
+            local body msg
+            if body=$(gh api "repos/$repo/commits/$branch" --jq '.sha, .commit.message' 2>/tmp/gh-err); then
+              branch_sha=${body%%$'\n'*}
+              msg=${body#*$'\n'}
+              branch_subject=${msg%%$'\n'*}
+              if [[ "$msg" =~ ${producer}@([0-9a-f]{7,}) ]]; then branch_marker=${BASH_REMATCH[1]}; else branch_marker=; fi
+              return 0
+            fi
+            case "$(cat /tmp/gh-err)" in
+              *"HTTP 404"*|*"HTTP 422"*) branch_sha=; branch_subject=; branch_marker=; return 0 ;;
+            esac
+            return 1
+          }
+
+          # **分支被删不等于没有记号。** 新的一轮先跑完并被合并后 platform 会删掉分支，排在后面的
+          # 旧运行于是在分支上查不到记号——若就此放行，它会拿旧摘要把滚动 PR 重建出来。合并把那一行
+          # 源提交带进了 main 上的文件，故回落到读文件。
+          #
+          # **首次运行有一次性空窗**：当前这一版是人工钉上去的，文件里还没有那一行，于是两处都取不到
+          # ⇒ 先后判定整块跳过 ⇒ 放行。方向是对的（第一次本就无历史可比，且放行只会把 dev 往主干尖端
+          # 推），滚动 PR 一合并就在文件里留下记号，空窗自愈。
+          # **从 main 上那份文件里读，不从提交说明读。** 记号与摘要现在写在同一次提交的同一个
+          # 文件里，两者因此永远一致；而 squash 提交说明来自 PR 标题，标题的写入与分支的推送
+          # 是两个动作，中间任何一次运行死掉都会让它与实际摘要对不上。
+          main_marker() {
+            local body
+            if body=$(gh api "repos/$repo/contents/$file?ref=main" -H "Accept: application/vnd.github.raw" 2>/tmp/gh-err); then
+              if [[ "$body" =~ ${producer}@([0-9a-f]{7,}) ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
+              return 0
+            fi
+            case "$(cat /tmp/gh-err)" in
+              *"HTTP 404"*|*"HTTP 422"*) return 0 ;;
+            esac
+            return 1
+          }
+
+          # **`GH_TOKEN` 只认证 `gh` 自己，不会让随后的裸 `git push` 用上它。** `gh repo clone` 产出的
+          # 是不含凭证的 HTTPS remote，不配凭证助手的话 push 以认证失败告终——而那个失败信息与
+          # 「令牌权限不足」在外观上一致，极难分辨。
+          gh auth setup-git
+
+          # ── 克隆、改、判先后、以比较并交换的方式推送 ─────────────────────────────
+          #
+          # **整段放在重试循环里，克隆也在其中。** 提交必须基于 platform 当下的 main：若克隆之后
+          # main 前进了（最常见的就是上一个滚动 PR 恰在此时被合入，那次改的正是同一行），本次提交
+          # 的基底就是旧的，推上去会得到一个与 main 冲突、根本合不了的 PR，而记号与租约都察觉不到。
+          # 故推之前再确认一次 main 没动，动了就带着新的 main 重来一遍。
+          #
+          # **不用并发闸做串行化。** GitHub 每个并发组只保留一个 pending 作业，新的进来会顶掉排队
+          # 那个（`cancel-in-progress: false` 只护正在跑的那个）。于是「旧的 A 在跑、最新的 C 排队、
+          # 中间的 B 进来」会把 C 丢掉。改用 git 自带的比较并交换：推送以「分支仍停在我刚读到的那个
+          # 值」为条件（分支不存在时期望值为空串，语义是「必须仍不存在」，两种状态同一个参数覆盖）。
+          # 谁都不会被丢弃；被别人抢先时重读重判，更旧的那一个自己会判出 behind 而退出。
+          #
+          # 三次为止：正常情况下第一次就成，重试是给相邻合并撞在一起的那几秒用的。连撞三次说明有
+          # 异常的推送风暴，此时**大声失败**而不是默默放弃——默默放弃就是本作业要消灭的东西。
+          pushed=
+          for attempt in 1 2 3; do
+            work=$(mktemp -d)
+            gh repo clone "$repo" "$work" -- --depth=1 --quiet
+            cd "$work"
+            base=$(git rev-parse HEAD)
+
+            # **只换那一行的值。** 用 python 而不是 sed：摘要里有 `/` 与 `@`，sed 的分隔符怎么选都要
+            # 转义，而选错时它会静默改出一个语法仍然合法的文件。找不到那一行即非零退出——路径漂移
+            # 过一次（pipelines 仓 2026-08-12），当时表现是镜像推成功、摘要没提上去，而构建全绿、
+            # 定时任务照跑，跑的却是旧代码。
+            state=$(python3 - "$file" "$IMAGE" "$SHA" "$TFVARS_KEY" "$producer" <<'PYEOF'
+          import pathlib, re, sys
+          p, image, sha, key, producer = pathlib.Path(sys.argv[1]), *sys.argv[2:6]
+          s = p.read_text()
+          img = re.compile('^(' + re.escape(key) + r'\s*=\s*)".*"$', re.M)
+          if not img.search(s):
+              sys.exit(f'{p} 里找不到 {key} 那一行')
+          new = img.sub(lambda m: m.group(1) + '"' + image + '"', s, count=1)
+          # 源提交与摘要写在同一次提交里，两者因此永远一致。放这里而不是放提交说明或 PR
+          # 标题：那两处与文件内容不原子，任何一个运行在中途死掉都会让它们对不上，而下一轮
+          # 正是靠它判断先后。
+          # 这段文本必须与已经写进各 tfvars 的那些行逐字一致，否则下次运行会再插一行而不是替换。
+          head = f'# 源提交（本行由 {producer} 的发布流水线自动维护，取记号以它为准）：'
+          line = head + producer + '@' + sha
+          mark = re.compile('^' + re.escape(head + producer) + r'@[0-9a-f]{7,}$', re.M)
+          if mark.search(new):
+              new = mark.sub(lambda m: line, new, count=1)
+          else:
+              new = img.sub(lambda m: line + chr(10) + m.group(0), new, count=1)
+          p.write_text(new)
+          print('same' if new == s else 'changed')
+          PYEOF
+          )
+            if [ "$state" = same ]; then
+              echo "::notice::摘要与 platform 现有的一致，无需提 PR"
+              exit 0
+            fi
+
+            git config user.name unilume-ci
+            git config user.email ci@unilume.com
+            git checkout -q -b "$branch"
+            git commit -q -am "${TITLE_PREFIX}跟到 $producer@$short"
+
+            read_branch || {
+              echo "::error::读滚动分支 $branch 的记号失败：$(head -c 200 /tmp/gh-err)。无法确定与上一轮的先后，拒绝推送以免退回旧摘要；重跑本作业即可"
+              exit 1
+            }
+            prev=$branch_marker
+            if [ -z "$prev" ]; then
+              prev=$(main_marker) || {
+                echo "::error::读 main 上 $file 的历史记号失败：$(head -c 200 /tmp/gh-err)。同上，拒绝推送以免退回旧摘要"
+                exit 1
+              }
+            fi
+
+            if [ -n "$prev" ]; then
+              # base...head 的 status 是 head 相对 base 而言。
+              rel=$(gh api "repos/$GITHUB_REPOSITORY/compare/$prev...$SHA" --jq .status 2>/dev/null || true)
+              # **白名单放行，其余一律 fail closed。** 这里判的是「能不能确定先后」，不是「要不要推」：
+              # 接口因限流、网络或鉴权失败时 `rel` 取不到值，那是**信息缺失**而非放行许可。
+              case "${rel:-}" in
+                behind)
+                  echo "::notice::本次源提交 $short 比分支上的 $prev 旧，跳过以免退回旧摘要"
+                  exit 0
+                  ;;
+                # ahead=本次更新，照常推。
+                #
+                # **identical 也放行。** 同一个源提交覆盖自己不构成任何乱序风险，而早退会挡住恢复：
+                # 推分支与建 PR 是两步，上一轮若在两步之间失败，分支留下了、PR 没建成，此后每次重跑
+                # 都在这里退出，滚动 PR 永远缺席且全程无声。放行后落到下面本就幂等的 `gh pr list`，
+                # 找不到 PR 就补建。手动触发因此也成了这种残局的恢复开关。
+                #
+                # diverged 只可能来自历史被重写，此时无从判断先后，按最新一次运行为准往下走。
+                ahead|identical|diverged) ;;
+                *)
+                  echo "::error::无法确定 $prev 与 $short 的先后（compare 返回「${rel:-空}」），拒绝推送以免退回旧摘要；重跑本作业即可"
+                  exit 1
+                  ;;
+              esac
+            fi
+
+            # 推之前重判一次：本轮若已被更新的提交取代，就此让出，别把旧摘要推上去。
+            yield_unless_tip
+
+            main_now=$(gh api "repos/$repo/commits/main" --jq .sha 2>/dev/null || true)
+            if [ -z "$main_now" ]; then
+              echo "::error::取不到 platform 的 main 尖端，无法确认本次提交的基底是否仍然当前，拒绝推送以免开出合不了的 PR"
+              exit 1
+            fi
+            if [ "$main_now" != "$base" ]; then
+              echo "::notice::platform 的 main 在克隆之后前进到 ${main_now:0:8}，基于新的 main 重来一次"
+              continue
+            fi
+
+            # 强推本身是要的语义：本次提交基于 platform 当下的 main，与分支上残留的上一轮除了共同
+            # 祖先之外没有关系。**只对这条分支成立**——platform 只对默认分支设了禁止非快进与禁止
+            # 删除的规则，其余分支不受保护。
+            if git push -q --force-with-lease="refs/heads/$branch:$branch_sha" origin "HEAD:refs/heads/$branch"; then
+              # **推完再验一次基底。** 租约只约束 `refs/heads/$branch` 的旧值，管不到 main；上面那次
+              # 确认与本次推送之间 main 仍可能前进，而若它改的正是同一行，这条分支就带着过期基底、
+              # 开出一个合不了的 PR。改用新的 main 重来一遍即可——重推的是同一行值，无副作用。
+              after=$(gh api "repos/$repo/commits/main" --jq .sha 2>/dev/null || true)
+              if [ -z "$after" ]; then
+                echo "::error::推送后取不到 platform 的 main 尖端，无法确认基底仍然当前；请人工核对滚动 PR 是否有冲突"
+                exit 1
+              fi
+              if [ "$after" != "$base" ]; then
+                echo "::notice::推送后发现 platform 的 main 已前进到 ${after:0:8}，基于新的 main 重做一遍"
+                continue
+              fi
+              pushed=1
+              break
+            fi
+            echo "::notice::第 $attempt 次推送被抢占（分支在读取之后被改动），重读记号后再判先后"
+          done
+          if [ -z "$pushed" ]; then
+            echo "::error::连续三次未能推上去（被抢占或 platform 的 main 一直在动），放弃本轮。请查看是否有异常的重复触发"
+            exit 1
+          fi
+
+          # ── PR 的标题与正文：从分支头派生，写完复核，不一致就重写 ─────────────
+          #
+          # 不变式：**PR 的元数据必须描述分支上当下那一版**。推送受租约保护而元数据不受，故取值
+          # 一律读分支头，写完再读一次核对；期间分支被改动就按新的分支头重写。
+          metadata_ok=
+          for attempt in 1 2 3; do
+            read_branch || {
+              echo "::error::读分支头以派生 PR 元数据失败：$(head -c 200 /tmp/gh-err)"
+              exit 1
+            }
+            snapshot=$branch_sha
+            title=$branch_subject
+
+            cat > /tmp/pr-body.md <<'BODYEOF'
+          由生产方仓的一次主干合并自动提出，只改本环境 tfvars 里的镜像摘要，以及它上面那行
+          自动维护的「源提交」。具体是哪个文件、哪一行，看下面的 diff。
+
+          源提交与摘要写在同一次提交里，两者因此永远一致；下一轮判断新旧就读这一行。
+          ⚠️ **文件里那段手写的「取自 backend 主干顶端 …」注释自本次起不再有人更新**，
+          它记的是接入自动提升之前的那一版。建议在本 PR 里一并删掉或改写，免得日后
+          与自动维护的那行各说各话。
+
+          **只动这一个环境。** 其它环境何时提升由人决定，要跟进时手工改对应环境的 tfvars。
+
+          **本 PR 是滚动的**：生产方每合一次主干就更新到最新摘要，因此任何时候最多
+          只有这一个待合。合并后分支被删，下次合并重新开。
+
+          **合并前它不会生效**——dev 上跑的仍是 platform 当前钉的那一版。这正是要的：
+          换版本是一次可审的提交。合并会触发本仓基础设施部署工作流里 `aws-dev` 那个作业的
+          apply（`.github/workflows/infra-deploy.yml`），那次 apply 即一次滚动发布。
+
+          BODYEOF
+            # 源提交也取分支上的记号，理由同上：正文必须描述分支上那一版，不是本轮这一版。
+            if [ -n "$branch_marker" ]; then
+              printf '\n来源提交：%s/%s/commit/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$branch_marker" >> /tmp/pr-body.md
+            fi
+
+            # `.[0].number` 在空数组上求值出 `null`，gh 会照字面打印出来——`[ -n "$num" ]` 于是
+            # 恒真，走进 edit 分支去改一个不存在的 PR。`// empty` 让它真的为空。
+            if [ -n "$VERIFY_HINT" ]; then
+              printf '\n验证：%s\n' "$VERIFY_HINT" >> /tmp/pr-body.md
+            fi
+
+            num=$(gh pr list --repo "$repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
+            if [ -n "$num" ]; then
+              gh pr edit --repo "$repo" "$num" --title "$title" --body-file /tmp/pr-body.md
+            else
+              gh pr create --repo "$repo" --head "$branch" --base main \
+                --title "$title" --body-file /tmp/pr-body.md
+            fi
+
+            read_branch || {
+              echo "::error::写入 PR 元数据后复核分支头失败：$(head -c 200 /tmp/gh-err)。元数据可能与分支内容不符，重跑本作业即可"
+              exit 1
+            }
+            if [ "$branch_sha" = "$snapshot" ]; then
+              metadata_ok=1
+              echo "::notice::platform 的滚动 PR 已更新到 ${branch_marker:-分支当前版本}"
+              break
+            fi
+            echo "::notice::写入元数据期间分支被更新的一轮改动，按新的分支头重写一次"
+          done
+          if [ -z "$metadata_ok" ]; then
+            echo "::error::连续三次在写入元数据期间分支都被改动，放弃。PR 的标题与正文可能与分支内容不符，重跑本作业即可"
+            exit 1
+          fi
