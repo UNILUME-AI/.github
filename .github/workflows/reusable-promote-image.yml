@@ -47,9 +47,14 @@ on:
   workflow_call:
     inputs:
       image:
-        description: "镜像的摘要引用，形如 <仓库>/<名字>@sha256:…。必须是摘要不是标签：tfvars 按摘要钉。"
+        description: >-
+          镜像的摘要引用，形如 <仓库>/<名字>@sha256:…。必须是摘要不是标签：tfvars 按摘要钉。
+          **留空 = 不换镜像，只把滚动 PR 重新基于基础设施仓当下的 main 建一遍**：沿用分支上已钉的
+          那一版摘要与它原来的源提交。给构建作业在手动触发时被跳过的调用方用（镜像仓标签不可变，
+          重推同一标签会被拒，故那些仓的手动入口不重新构建）。分支不存在＝没有待重建的东西，安静退出。
         type: string
-        required: true
+        required: false
+        default: ""
       tfvars-path:
         description: "基础设施仓里那份 tfvars 的仓内路径。"
         type: string
@@ -119,13 +124,6 @@ jobs:
           short=${SHA:0:8}
           branch=$TARGET_BRANCH
 
-          # **空摘要必须在这里停下。** 上游取不到摘要就已经整轮失败，正常情况下轮不到这条；但真
-          # 漏过来的话，下面的替换会往 tfvars 里写一个空串，而那是个语法合法的赋值——apply 会拿
-          # 空镜像去登记任务定义，dev 的服务随之拉不起来。宁可在这里失败。
-          if [ -z "$IMAGE" ]; then
-            echo "::error::上游没有传出镜像摘要，拒绝改 tfvars"
-            exit 1
-          fi
 
           # **只有主干尖端才发布**，与 release-dev 的 `tip` 步骤同构。光靠 `needs: release-dev`
           # 不够：那个作业在自己不是尖端时会跳过全部迁移步骤并以成功结束，它的成功因此不等于
@@ -269,6 +267,40 @@ jobs:
             content=$(fetch_tfvars main) || return 1
             marker_in "$content"
           }
+
+          # ── image 留空：不换镜像，只把滚动 PR 重新基于当下的 main 建一遍 ────────────
+          #
+          # 沿用分支上已钉的那一版摘要**与它原来的源提交**——镜像既然一个字节都没变，把标题写成
+          # 跟到当前 main 是不实的，而记号还要拿去和下一轮比新旧，改掉就与镜像对不上了。
+          #
+          # 分支不存在（上一轮已合并、随之被删）说明没有待重建的东西，安静退出而不是报错。
+          if [ -z "$IMAGE" ]; then
+            read_branch || {
+              echo "::error::读滚动分支 $branch 失败：$(head -c 200 /tmp/gh-err)。无法判断有无待重建的摘要"
+              exit 1
+            }
+            if [ -z "$branch_sha" ]; then
+              echo "::notice::滚动分支 $branch 不存在，没有待重建的摘要，退出"
+              exit 0
+            fi
+            content=$(fetch_tfvars "$branch_sha") || {
+              echo "::error::读分支上的 $file 失败：$(head -c 200 /tmp/gh-err)"
+              exit 1
+            }
+            # 与下面 python 段同一条判据（`^<键>\s*=\s*"…"$`），避免两处对「怎样算那一行」看法不一。
+            IMAGE=$(printf '%s\n' "$content" | TFVARS_KEY="$TFVARS_KEY" python3 -c '
+          import os, re, sys
+          m = re.search("^" + re.escape(os.environ["TFVARS_KEY"]) + r"\s*=\s*\"(.*)\"$", sys.stdin.read(), re.M)
+          print(m.group(1) if m else "")')
+            if [ -z "$IMAGE" ] || [ -z "$branch_marker" ]; then
+              echo "::notice::滚动分支 $branch 上没有可重建的摘要或记号，退出"
+              exit 0
+            fi
+            # 源提交与短号都回退成分支上那一版，标题与记号因此与镜像一致。
+            SHA=$branch_marker
+            short=${branch_marker:0:8}
+            echo "::notice::从 $branch 读回 $producer@$short 的摘要，将基于当下的 main 重建"
+          fi
 
           # **`GH_TOKEN` 只认证 `gh` 自己，不会让随后的裸 `git push` 用上它。** `gh repo clone` 产出的
           # 是不含凭证的 HTTPS remote，不配凭证助手的话 push 以认证失败告终——而那个失败信息与
