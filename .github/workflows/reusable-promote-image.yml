@@ -177,13 +177,75 @@ jobs:
 
           # 滚动分支的头。**sha、标题与记号必须同一次调用取回**：分两次读的话，两次之间分支可能已
           # 被别的运行推动，于是租约用的是新值、先后判的是旧记号，恰好把下面那道比较并交换绕过去。
+          # 取某个提交上那份 tfvars 的内容。**按 sha 取是原子的**：问的就是那一个提交的那一份文件，
+          # 不会读到之后被别人推上去的内容。确实不存在时输出为空并返 0，查询失败返 1。
+          fetch_tfvars() { # $1=ref
+            local c
+            if c=$(gh api "repos/$repo/contents/$file?ref=$1" -H "Accept: application/vnd.github.raw" 2>/tmp/gh-err); then
+              printf '%s\n' "$c"
+              return 0
+            fi
+            case "$(cat /tmp/gh-err)" in
+              *"HTTP 404"*|*"HTTP 422"*) return 0 ;;
+            esac
+            return 1
+          }
+
+          # 从一份 tfvars 内容里取本生产方的记号。
+          #
+          # **只认自动维护的那一整行，不是「文件里任何含 <生产方>@ 的地方」。** 宽匹配会把两类东西
+          # 误数进来：镜像引用本身就可能长成 `<生产方>@sha256:…`（db-migrate 推的镜像仓正是这个
+          # 名字，那一行必然命中），手写注释也可能顺手引用某个提交。误数的后果不是取错值而是判成
+          # 歧义、每次提升都推不出去。下面 python 段用的就是锚定整行的正则，这里与它对齐。
+          #
+          # 多于一条才是真歧义，那时取首个是在猜，宁可停下。
+          # **判据是整行相等，不是包含。** 逐行比：前缀必须从行首起，其后必须只剩提交号，多一个字都
+          # 不算。子串匹配不够——注释里引用一句那行（前缀出现在行中）会被误数，而误数的后果是判成
+          # 歧义、每次提升都推不出去。
+          #
+          # 不用正则做这件事：生产方名来自仓名，可能含 `.` `-` 这类正则元字符，拼进模式要转义，
+          # 而转义漏一处就又变回宽匹配。用 `${line#"$prefix"}` 剥前缀是字面比较，没有这个问题。
+          marker_in() { # $1=文件内容
+            local prefix line sha n=0 bad=0 found=
+            prefix="# 源提交（本行由 ${producer} 的发布流水线自动维护，取记号以它为准）：${producer}@"
+            while IFS= read -r line; do
+              # 剥不掉前缀 ⇒ 不是以它开头 ⇒ 与本记号无关（含行中引用的情形）。
+              if [ "${line#"$prefix"}" = "$line" ]; then
+                continue
+              fi
+              sha=${line#"$prefix"}
+              if [[ "$sha" =~ ^[0-9a-f]{7,}$ ]]; then
+                n=$((n + 1)); found=$sha
+              else
+                # 以记号前缀开头、其后却不是提交号 ⇒ 有人手改过，无从判断先后。
+                bad=1
+              fi
+            done <<< "$1"
+            if [ "$bad" -eq 1 ]; then
+              echo "::error::$file 里 $producer 的源提交记号取值异常，无法判断新旧" >&2
+              return 1
+            fi
+            if [ "$n" -gt 1 ]; then
+              echo "::error::$file 里有多条 $producer 的源提交记号，无法判断新旧" >&2
+              return 1
+            fi
+            if [ "$n" -eq 1 ]; then
+              printf '%s\n' "$found"
+            fi
+            return 0
+          }
+
           read_branch() { # 成功返 0 并设置 branch_sha / branch_subject / branch_marker；查询失败返 1
-            local body msg
+            local body msg content
             if body=$(gh api "repos/$repo/commits/$branch" --jq '.sha, .commit.message' 2>/tmp/gh-err); then
               branch_sha=${body%%$'\n'*}
               msg=${body#*$'\n'}
               branch_subject=${msg%%$'\n'*}
-              if [[ "$msg" =~ ${producer}@([0-9a-f]{7,}) ]]; then branch_marker=${BASH_REMATCH[1]}; else branch_marker=; fi
+              # **记号取分支头那个提交里的文件内容，不取提交说明。** 两者本来一致，但滚动分支上
+              # 一旦有人工提交（例如有人在这个 PR 里附带别的修改），头部说明就不含记号，排序信号
+              # 会在该分支上断掉。记号既然已经写进文件、与摘要同一次提交，就该一直从文件读。
+              content=$(fetch_tfvars "$branch_sha") || return 1
+              branch_marker=$(marker_in "$content") || return 1
               return 0
             fi
             case "$(cat /tmp/gh-err)" in
@@ -199,24 +261,13 @@ jobs:
           # **首次运行有一次性空窗**：当前这一版是人工钉上去的，文件里还没有那一行，于是两处都取不到
           # ⇒ 先后判定整块跳过 ⇒ 放行。方向是对的（第一次本就无历史可比，且放行只会把 dev 往主干尖端
           # 推），滚动 PR 一合并就在文件里留下记号，空窗自愈。
-          # **从 main 上那份文件里读，不从提交说明读。** 记号与摘要现在写在同一次提交的同一个
-          # 文件里，两者因此永远一致；而 squash 提交说明来自 PR 标题，标题的写入与分支的推送
-          # 是两个动作，中间任何一次运行死掉都会让它与实际摘要对不上。
+          # **从 main 上那份文件里读，不从提交说明读。** 记号与摘要写在同一次提交的同一个文件里，
+          # 两者因此永远一致；而 squash 提交说明来自 PR 标题，标题的写入与分支的推送是两个动作，
+          # 中间任何一次运行死掉都会让它与实际摘要对不上。
           main_marker() {
-            local body
-            if body=$(gh api "repos/$repo/contents/$file?ref=main" -H "Accept: application/vnd.github.raw" 2>/tmp/gh-err); then
-              # 同上：多条同生产方记号时取首个是在猜，宁可停下。
-              if [ "$(printf '%s\n' "$body" | grep -c "${producer}@" || true)" -gt 1 ]; then
-                echo "::error::$file 里有多条 $producer 的源提交记号，无法判断新旧" >&2
-                return 1
-              fi
-              if [[ "$body" =~ ${producer}@([0-9a-f]{7,}) ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
-              return 0
-            fi
-            case "$(cat /tmp/gh-err)" in
-              *"HTTP 404"*|*"HTTP 422"*) return 0 ;;
-            esac
-            return 1
+            local content
+            content=$(fetch_tfvars main) || return 1
+            marker_in "$content"
           }
 
           # **`GH_TOKEN` 只认证 `gh` 自己，不会让随后的裸 `git push` 用上它。** `gh repo clone` 产出的
@@ -390,6 +441,10 @@ jobs:
 
           **本 PR 是滚动的**：生产方每合一次主干就更新到最新摘要，因此任何时候最多
           只有这一个待合。合并后分支被删，下次合并重新开。
+
+          ⚠️ **这条分支会被下次更新整个覆盖**——每一轮都是从本仓 main 重新克隆、改一行、再强推，
+          分支上多出来的提交不会被保留。要在本 PR 里附带别的修改是可以的，但**必须赶在生产方
+          下次合并主干之前合掉**，否则会随覆盖一起丢失；更稳妥的做法是另开一个 PR 改 main。
 
           **合并前它不会生效**——dev 上跑的仍是 platform 当前钉的那一版。这正是要的：
           换版本是一次可审的提交。合并会触发本仓基础设施部署工作流里 `aws-dev` 那个作业的
