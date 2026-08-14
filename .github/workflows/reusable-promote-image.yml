@@ -131,6 +131,23 @@ jobs:
           trigger_sha=$SHA
 
 
+          # **取提交号的判据是形状，不是非空。** `gh api` 在 4xx/5xx 时把错误体写到 **stdout**
+          # 而不是 stderr（实测：404 时 stdout 是 118 字节的 `{"message":"Not Found"…}`，退出码 1），
+          # 于是 `2>/dev/null || true` 既挡不住它、也吞掉了退出码，「取到了非空值」因此不等于
+          # 「取到了提交号」。拿那串 JSON 去比对必然不相等，得出的是「主干已前进」这种看着合理、
+          # 实则凭空的结论——而这条路是静默 exit 0，正是 fail closed 要防的那种假绿。
+          api_sha() { # $1=API 路径。成功打印 40 位提交号并返 0；失败返 1，诊断留在 /tmp/gh-err
+            local out rc
+            out=$(gh api "$1" --jq .sha 2>/tmp/gh-err)
+            rc=$?
+            if [ $rc -ne 0 ] || ! [[ "$out" =~ ^[0-9a-f]{40}$ ]]; then
+              # 错误体在 stdout，报错信息只看 stderr 会漏掉真正有用的那半句，故两处并起来。
+              printf '%s\n' "$out" >> /tmp/gh-err
+              return 1
+            fi
+            printf '%s\n' "$out"
+          }
+
           # **只有主干尖端才发布**，与 release-dev 的 `tip` 步骤同构。光靠 `needs: release-dev`
           # 不够：那个作业在自己不是尖端时会跳过全部迁移步骤并以成功结束，它的成功因此不等于
           # 迁移跑过。两道判据都不满足时谁也不发布，dev 停在上一个镜像与结构相互一致的版本上；
@@ -140,11 +157,11 @@ jobs:
           # 这个不变式于是只在开头成立——半执行的不变式比不执行更难推理。
           yield_unless_tip() {
             local tip
-            tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha 2>/dev/null || true)
-            if [ -z "$tip" ]; then
-              echo "::error::取不到主干尖端，无法判断本次是否已被更新的提交取代，拒绝推送以免发布落后于结构变更的镜像"
+            # `local` 与赋值必须分两行：写成 `local tip=$(...)` 时 `$?` 是 `local` 的退出码，取值失败会被吞掉。
+            tip=$(api_sha "repos/$GITHUB_REPOSITORY/commits/main") || {
+              echo "::error::取不到主干尖端（$(head -c 200 /tmp/gh-err)），无法判断本次是否已被更新的提交取代，拒绝推送以免发布落后于结构变更的镜像"
               exit 1
-            fi
+            }
             if [ "$tip" != "$trigger_sha" ]; then
               echo "::notice::主干已前进到 ${tip:0:8}，本次（${trigger_sha:0:8}）不再发布，交给尖端那次"
               exit 0
@@ -420,11 +437,10 @@ jobs:
             # 推之前重判一次：本轮若已被更新的提交取代，就此让出，别把旧摘要推上去。
             yield_unless_tip
 
-            main_now=$(gh api "repos/$repo/commits/main" --jq .sha 2>/dev/null || true)
-            if [ -z "$main_now" ]; then
-              echo "::error::取不到 platform 的 main 尖端，无法确认本次提交的基底是否仍然当前，拒绝推送以免开出合不了的 PR"
+            main_now=$(api_sha "repos/$repo/commits/main") || {
+              echo "::error::取不到 platform 的 main 尖端（$(head -c 200 /tmp/gh-err)），无法确认本次提交的基底是否仍然当前，拒绝推送以免开出合不了的 PR"
               exit 1
-            fi
+            }
             if [ "$main_now" != "$base" ]; then
               echo "::notice::platform 的 main 在克隆之后前进到 ${main_now:0:8}，基于新的 main 重来一次"
               continue
@@ -437,11 +453,10 @@ jobs:
               # **推完再验一次基底。** 租约只约束 `refs/heads/$branch` 的旧值，管不到 main；上面那次
               # 确认与本次推送之间 main 仍可能前进，而若它改的正是同一行，这条分支就带着过期基底、
               # 开出一个合不了的 PR。改用新的 main 重来一遍即可——重推的是同一行值，无副作用。
-              after=$(gh api "repos/$repo/commits/main" --jq .sha 2>/dev/null || true)
-              if [ -z "$after" ]; then
-                echo "::error::推送后取不到 platform 的 main 尖端，无法确认基底仍然当前；请人工核对滚动 PR 是否有冲突"
+              after=$(api_sha "repos/$repo/commits/main") || {
+                echo "::error::推送后取不到 platform 的 main 尖端（$(head -c 200 /tmp/gh-err)），无法确认基底仍然当前；请人工核对滚动 PR 是否有冲突"
                 exit 1
-              fi
+              }
               if [ "$after" != "$base" ]; then
                 echo "::notice::推送后发现 platform 的 main 已前进到 ${after:0:8}，基于新的 main 重做一遍"
                 continue
