@@ -10,7 +10,12 @@
 #   jobs:
 #     handoff:
 #       needs: [build-push, migrate]      # migrate 可无
-#       if: ${{ !cancelled() && needs.build-push.result == 'success' }}
+#       # **用 always() 而不是 !cancelled()。** 目的是让「migrate 被并发闸顶掉取消」这件事能走到
+#       # 下面的分诊里被大声报出来，而 `cancelled()` 是否把「被取消的依赖」也算进去，官方文档只
+#       # 写了「workflow was canceled」、未覆盖这一情形。always() 在两种解读下都放行，故取它。
+#       # 代价（可接受）：人工取消整个 run 之后、若构建已成功，本作业仍会跑。但提升与否是按主干
+#       # 尖端判定的——那个提交既然已在 main 且是尖端，提升它本就正确，何况不会自动合并。
+#       if: ${{ always() && needs.build-push.result == 'success' }}
 #       # 按 commit SHA 钉（Sonar 供应链规则：可变的 @main 过不了门）。取 SHA：
 #       #   gh api repos/UNILUME-AI/.github/commits/main --jq .sha
 #       # 行尾不要写日期或版本注释：自家 reusable 没有版本 tag，Dependabot 会更新 SHA 而注释
@@ -31,7 +36,7 @@
 # 调用方为什么还得自己写 needs / if（挪不进来）：
 #   - `needs` 指的是调用方自己的作业名，本工作流看不见也管不着；
 #   - 上游被**取消**时（并发组顶掉排队作业）`needs` 默认会把本作业一并跳过，那件事就此无声。
-#     调用方用 `if: !cancelled() && …` 放行进来，本工作流再按 migration-result 分诊并大声失败。
+#     调用方用上面那个 `always()` 条件放行进来，本工作流再按 migration-result 分诊并大声失败。
 #
 # 令牌要求：对基础设施仓有写权限，且**不能用默认 GITHUB_TOKEN**——它既不能跨仓写，开的 PR 也
 # 不触发任何 workflow（GitHub 的防循环机制），那样对方的必需 check 会永远停在 pending。
@@ -368,9 +373,8 @@ jobs:
           自动维护的「源提交」。具体是哪个文件、哪一行，看下面的 diff。
 
           源提交与摘要写在同一次提交里，两者因此永远一致；下一轮判断新旧就读这一行。
-          ⚠️ **文件里那段手写的「取自 backend 主干顶端 …」注释自本次起不再有人更新**，
-          它记的是接入自动提升之前的那一版。建议在本 PR 里一并删掉或改写，免得日后
-          与自动维护的那行各说各话。
+          ⚠️ 若这份 tfvars 里还留着**手写的、记录源提交的注释**（接入自动提升之前那种），
+          它自本次起不再有人更新，建议一并删掉或改写，免得日后与自动维护的那行各说各话。
 
           **只动这一个环境。** 其它环境何时提升由人决定，要跟进时手工改对应环境的 tfvars。
 
