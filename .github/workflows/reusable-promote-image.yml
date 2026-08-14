@@ -199,25 +199,40 @@ jobs:
           # 歧义、每次提升都推不出去。下面 python 段用的就是锚定整行的正则，这里与它对齐。
           #
           # 多于一条才是真歧义，那时取首个是在猜，宁可停下。
+          # **判据是整行相等，不是包含。** 逐行比：前缀必须从行首起，其后必须只剩提交号，多一个字都
+          # 不算。子串匹配不够——注释里引用一句那行（前缀出现在行中）会被误数，而误数的后果是判成
+          # 歧义、每次提升都推不出去。
+          #
+          # 不用正则做这件事：生产方名来自仓名，可能含 `.` `-` 这类正则元字符，拼进模式要转义，
+          # 而转义漏一处就又变回宽匹配。用 `${line#"$prefix"}` 剥前缀是字面比较，没有这个问题。
           marker_in() { # $1=文件内容
-            local prefix n line sha
+            local prefix line sha n=0 bad=0 found=
             prefix="# 源提交（本行由 ${producer} 的发布流水线自动维护，取记号以它为准）：${producer}@"
-            n=$(printf '%s\n' "$1" | grep -cF -- "$prefix" || true)
+            while IFS= read -r line; do
+              # 剥不掉前缀 ⇒ 不是以它开头 ⇒ 与本记号无关（含行中引用的情形）。
+              if [ "${line#"$prefix"}" = "$line" ]; then
+                continue
+              fi
+              sha=${line#"$prefix"}
+              if [[ "$sha" =~ ^[0-9a-f]{7,}$ ]]; then
+                n=$((n + 1)); found=$sha
+              else
+                # 以记号前缀开头、其后却不是提交号 ⇒ 有人手改过，无从判断先后。
+                bad=1
+              fi
+            done <<< "$1"
+            if [ "$bad" -eq 1 ]; then
+              echo "::error::$file 里 $producer 的源提交记号取值异常，无法判断新旧" >&2
+              return 1
+            fi
             if [ "$n" -gt 1 ]; then
               echo "::error::$file 里有多条 $producer 的源提交记号，无法判断新旧" >&2
               return 1
             fi
-            if [ "$n" -eq 0 ]; then
-              return 0
+            if [ "$n" -eq 1 ]; then
+              printf '%s\n' "$found"
             fi
-            line=$(printf '%s\n' "$1" | grep -F -- "$prefix" || true)
-            sha=${line#"$prefix"}
-            # 记号行在但取值不像提交号 ⇒ 有人手改过，同样无从判断先后。
-            if [[ ! "$sha" =~ ^[0-9a-f]{7,}$ ]]; then
-              echo "::error::$file 里 $producer 的源提交记号取值异常（$sha），无法判断新旧" >&2
-              return 1
-            fi
-            printf '%s\n' "$sha"
+            return 0
           }
 
           read_branch() { # 成功返 0 并设置 branch_sha / branch_subject / branch_marker；查询失败返 1
