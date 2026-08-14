@@ -123,6 +123,12 @@ jobs:
           file=$TFVARS_PATH
           short=${SHA:0:8}
           branch=$TARGET_BRANCH
+          # **谁触发了这次运行**，与「这个镜像来自哪个提交」是两件事，平时相等，只有下面那条重建
+          # 路径会把它们劈开。尖端判据问的是前者（本次运行是否仍代表主干尖端），记号、标题与新旧
+          # 比对问的是后者。**同一个变量兼两种语义会让重建路径永不推送**：那时 SHA 被换成旧的产镜像
+          # 提交，而尖端判据拿它去比 main 的尖端必然不等，于是在推送前退出——恰好是这条路径存在的
+          # 前提（main 已前进）。故这里就分开。
+          trigger_sha=$SHA
 
 
           # **只有主干尖端才发布**，与 release-dev 的 `tip` 步骤同构。光靠 `needs: release-dev`
@@ -139,8 +145,8 @@ jobs:
               echo "::error::取不到主干尖端，无法判断本次是否已被更新的提交取代，拒绝推送以免发布落后于结构变更的镜像"
               exit 1
             fi
-            if [ "$tip" != "$SHA" ]; then
-              echo "::notice::主干已前进到 ${tip:0:8}，本次（$short）不再发布，交给尖端那次"
+            if [ "$tip" != "$trigger_sha" ]; then
+              echo "::notice::主干已前进到 ${tip:0:8}，本次（${trigger_sha:0:8}）不再发布，交给尖端那次"
               exit 0
             fi
           }
@@ -297,6 +303,8 @@ jobs:
               exit 0
             fi
             # 源提交与短号都回退成分支上那一版，标题与记号因此与镜像一致。
+            # **只改这两个，不动 trigger_sha**：尖端判据要问的仍是「本次运行是否代表主干尖端」，
+            # 而本次触发的就是尖端；拿旧的产镜像提交去比会必然不等，把这条路径整个堵死。
             SHA=$branch_marker
             short=${branch_marker:0:8}
             echo "::notice::从 $branch 读回 $producer@$short 的摘要，将基于当下的 main 重建"
