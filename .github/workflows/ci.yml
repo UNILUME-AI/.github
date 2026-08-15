@@ -58,3 +58,21 @@ jobs:
         # 它放在仓外本就无法被 uses: 引用（reusable 必须位于 .github/workflows/）。
         # 保持「所有 workflow 都在扫描范围内」这个不变式，不要再在别处新建。
         run: pipx run "zizmor==${ZIZMOR_VERSION}" .github/
+
+  # actionlint 与 zizmor 看的是 workflow 的形状与供应链，看不出内嵌脚本的语义。
+  # reusable-promote-image.yml 里读写「源提交记号」的那两段就属于后者：它们对「什么算
+  # 一条记号」的看法必须一致，弄错的表现是同一份 tfvars 里出现两条记号，四个消费方的
+  # 镜像提升一起停摆。测试从 workflow 里现取现跑，故不会与它漂移。
+  promote-marker-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 只用标准库，runner 自带的 python3 足够；不装依赖也就没有依赖可锁。
+      - name: 源提交记号的读写
+        run: python3 tests/test_promote_marker.py
