@@ -92,6 +92,13 @@ check("旧格式（无链接）的记号被替换而不是重复", rc == 0 and l
 check("替换后带上链接", lines[:1] == [f"{HEAD}{PRODUCER}@{NEW_SHA} {PRODUCER_URL}/commit/{NEW_SHA}"], lines[:1])
 check("旧格式替换后报告为 changed", state == "changed", state)
 
+# 读取侧只取第一个空格之前的提交号、其后一概不校验，写入侧就必须认得同样宽的后缀。
+# 两侧不对齐时，人在链接后面补一句说明这种再普通不过的举动，就会让写入侧认不出那一行、
+# 转而再插一条，下一轮直接判成歧义停摆——而读取侧一路都读得好好的，症状与原因隔了一轮。
+annotated = tfvars(f"{HEAD}{PRODUCER}@{OLD_SHA} {PRODUCER_URL}/commit/{OLD_SHA} 已人工核对")
+rc, out, state, err = write_marker(annotated)
+check("记号后带多词说明时仍被替换而不是重复", rc == 0 and len(marker_lines(out)) == 1, f"rc={rc} 共 {len(marker_lines(out))} 条 {err}")
+
 # 已是新格式时同样只更新那一行。
 current = tfvars(f"{HEAD}{PRODUCER}@{OLD_SHA} {PRODUCER_URL}/commit/{OLD_SHA}")
 rc, out, state, err = write_marker(current)
