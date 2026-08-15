@@ -118,6 +118,8 @@ jobs:
           repo=$PLATFORM_REPO
           # 生产方仓名，用于记号前缀与提交说明。取调用方的仓——workflow_call 里 github 上下文属调用方。
           producer=${GITHUB_REPOSITORY##*/}
+          # 生产方仓的地址，用来把记号里那个提交号写成可点的链接。同样取调用方的仓。
+          producer_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
           # **只更 dev。** 环境梯队是 dev→qa→prod 逐级提升，越靠近生产越应当保持显式提升；
           # 其它环境何时提升由人决定，要跟进时手工改对应环境的 tfvars。
           file=$TFVARS_PATH
@@ -220,21 +222,26 @@ jobs:
           # 歧义、每次提升都推不出去。下面 python 段用的就是锚定整行的正则，这里与它对齐。
           #
           # 多于一条才是真歧义，那时取首个是在猜，宁可停下。
-          # **判据是整行相等，不是包含。** 逐行比：前缀必须从行首起，其后必须只剩提交号，多一个字都
-          # 不算。子串匹配不够——注释里引用一句那行（前缀出现在行中）会被误数，而误数的后果是判成
-          # 歧义、每次提升都推不出去。
+          # **判据是行首前缀加其后的提交号，不是整行相等。** 记号之后还跟着指向该提交的链接
+          # （见下面 python 段），故只取到第一个空格为止；前缀仍必须从行首起。子串匹配不够——
+          # 注释里引用一句那行（前缀出现在行中）会被误数，而误数的后果是判成歧义、每次提升都推不出去。
+          #
+          # **链接之外的部分不校验。** 这里要回答的只是「能不能取到提交号判先后」，取到了就能判；
+          # 记号后面写了什么都不影响这个判断，过严反而会把人手工补的说明判成异常而卡住提升。
           #
           # 不用正则做这件事：生产方名来自仓名，可能含 `.` `-` 这类正则元字符，拼进模式要转义，
           # 而转义漏一处就又变回宽匹配。用 `${line#"$prefix"}` 剥前缀是字面比较，没有这个问题。
           marker_in() { # $1=文件内容
-            local prefix line sha n=0 bad=0 found=
+            local prefix line rest sha n=0 bad=0 found=
             prefix="# 源提交（本行由 ${producer} 的发布流水线自动维护，取记号以它为准）：${producer}@"
             while IFS= read -r line; do
               # 剥不掉前缀 ⇒ 不是以它开头 ⇒ 与本记号无关（含行中引用的情形）。
               if [ "${line#"$prefix"}" = "$line" ]; then
                 continue
               fi
-              sha=${line#"$prefix"}
+              rest=${line#"$prefix"}
+              # 记号后若跟着链接，取第一个空格之前的部分；没有空格时 `%% *` 原样返回。
+              sha=${rest%% *}
               if [[ "$sha" =~ ^[0-9a-f]{7,}$ ]]; then
                 n=$((n + 1)); found=$sha
               else
@@ -358,9 +365,9 @@ jobs:
             # 转义，而选错时它会静默改出一个语法仍然合法的文件。找不到那一行即非零退出——路径漂移
             # 过一次（pipelines 仓 2026-08-12），当时表现是镜像推成功、摘要没提上去，而构建全绿、
             # 定时任务照跑，跑的却是旧代码。
-            state=$(python3 - "$file" "$IMAGE" "$SHA" "$TFVARS_KEY" "$producer" <<'PYEOF'
+            state=$(python3 - "$file" "$IMAGE" "$SHA" "$TFVARS_KEY" "$producer" "$producer_url" <<'PYEOF'
           import pathlib, re, sys
-          p, image, sha, key, producer = pathlib.Path(sys.argv[1]), *sys.argv[2:6]
+          p, image, sha, key, producer, producer_url = pathlib.Path(sys.argv[1]), *sys.argv[2:7]
           s = p.read_text()
           img = re.compile('^(' + re.escape(key) + r'\s*=\s*)".*"$', re.M)
           if not img.search(s):
@@ -369,10 +376,17 @@ jobs:
           # 源提交与摘要写在同一次提交里，两者因此永远一致。放这里而不是放提交说明或 PR
           # 标题：那两处与文件内容不原子，任何一个运行在中途死掉都会让它们对不上，而下一轮
           # 正是靠它判断先后。
-          # 这段文本必须与已经写进各 tfvars 的那些行逐字一致，否则下次运行会再插一行而不是替换。
+          #
+          # **记号之后跟一条指向该提交的链接。** 这份文件被读到的绝大多数场合都不在 PR 里
+          # （直接看仓、看 blame、本地打开），那时裸记号无从跟进——AGENTS.md 的注释规范要求
+          # 引用来源就给链接。记号本身原样保留在前：它是上面 marker_in 与下面 mark 判先后的
+          # 取值处，位置一动两处解析都要跟着改。
           head = f'# 源提交（本行由 {producer} 的发布流水线自动维护，取记号以它为准）：'
-          line = head + producer + '@' + sha
-          mark = re.compile('^' + re.escape(head + producer) + r'@[0-9a-f]{7,}$', re.M)
+          line = f'{head}{producer}@{sha} {producer_url}/commit/{sha}'
+          # 链接段可选，为的是**认得出接入链接之前写下的那些行**：不认的话它们不会被替换，
+          # 而是被再插一行，于是同一份文件里出现两条记号、下一轮直接判成歧义停摆。写成
+          # non-capturing，好让下面的 findall 数的是整行而不是分组。
+          mark = re.compile('^' + re.escape(head + producer) + r'@[0-9a-f]{7,}(?: \S+)?$', re.M)
           # 记号按生产方而不是按键区分，故同一份文件里同一生产方只能有一条。今天的四个消费方
           # 各占一个键、互不同名，pipelines 的两个键还跨两份文件，所以撞不上。真撞上时**大声
           # 失败**而不是改错那一条——届时再决定是把记号按键限定，还是把键拆到不同文件。
